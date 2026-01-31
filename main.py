@@ -1,2139 +1,1928 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, filedialog
-import json
-import hashlib
-import base64
-import os
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
 import sqlite3
-import time
-from datetime import datetime, timedelta
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding as sym_padding
+import hashlib
 import secrets
-import queue
-import threading
+import json
+import os
+from datetime import datetime, timedelta
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.backends import default_backend
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from base64 import b64encode, b64decode
+import functools
 
-# ====================== DATABASE SETUP ======================
-class Database:
-    def __init__(self, db_file="securechat.db"):
-        self.db_file = db_file
-        self.init_database()
+# Initialize Flask app
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+# Configuration
+CONFIG = {
+    "app_config": {
+        "key_size": 2048,
+        "hash_algorithm": "SHA256",
+        "encryption_algorithm": "RSA-OAEP",
+        "signature_algorithm": "RSA-PSS"
+    },
+    "ca_config": {
+        "ca_name": "SecureChat CA",
+        "validity_days": 365
+    }
+}
+
+DATABASE_PATH = "secure_chat.db"
+KEYS_DIR = "user_keys"
+
+# Create keys directory
+os.makedirs(KEYS_DIR, exist_ok=True)
+
+# Database initialization
+def init_database():
+    """Initialize SQLite database with required tables"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
     
-    def init_database(self):
-        """Initialize database tables"""
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
-        
-        # Users table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                encrypted_private_key TEXT NOT NULL,
-                salt TEXT NOT NULL,
-                iv TEXT NOT NULL,
-                public_key TEXT NOT NULL,
-                certificate TEXT NOT NULL,
-                security_questions TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Messages table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sender TEXT NOT NULL,
-                receiver TEXT NOT NULL,
-                message TEXT NOT NULL,
-                encrypted INTEGER DEFAULT 1,
-                signed INTEGER DEFAULT 1,
-                signature TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Admin credentials
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS admin (
-                id INTEGER PRIMARY KEY,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                salt TEXT NOT NULL
-            )
-        ''')
-        
-        # Insert default admin if not exists
-        admin_salt = os.urandom(16)
-        admin_password = "admin123@"
-        admin_hash = hashlib.pbkdf2_hmac(
-            'sha256',
-            admin_password.encode(),
-            admin_salt,
-            100000
+    # Users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            public_key TEXT NOT NULL,
+            certificate TEXT NOT NULL,
+            security_q1 TEXT NOT NULL,
+            security_a1_hash TEXT NOT NULL,
+            security_q2 TEXT NOT NULL,
+            security_a2_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active BOOLEAN DEFAULT 1
         )
-        
-        cursor.execute('''
-            INSERT OR IGNORE INTO admin (id, email, password_hash, salt)
-            VALUES (1, ?, ?, ?)
-        ''', ("admin@gmail.com", 
-              base64.b64encode(admin_hash).decode(),
-              base64.b64encode(admin_salt).decode()))
-        
-        conn.commit()
-        conn.close()
+    ''')
     
-    def save_user(self, username, encrypted_private_key, salt, iv, public_key, certificate, security_questions):
-        """Save user to database"""
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT OR REPLACE INTO users 
-            (username, encrypted_private_key, salt, iv, public_key, certificate, security_questions)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (username, encrypted_private_key, salt, iv, public_key, 
-              json.dumps(certificate), json.dumps(security_questions)))
-        
-        conn.commit()
-        conn.close()
+    # Messages table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER NOT NULL,
+            recipient_id INTEGER NOT NULL,
+            encrypted_message TEXT NOT NULL,
+            digital_signature TEXT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_read BOOLEAN DEFAULT 0,
+            FOREIGN KEY (sender_id) REFERENCES users(user_id),
+            FOREIGN KEY (recipient_id) REFERENCES users(user_id)
+        )
+    ''')
     
-    def get_user(self, username):
-        """Get user from database"""
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
+    # Admin users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS admin_users (
+            admin_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Login attempts table (tracks failed attempts per username for lockout)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            failed_attempts INTEGER DEFAULT 0,
+            locked BOOLEAN DEFAULT 0,
+            locked_at TIMESTAMP NULL
+        )
+    ''')
+    
+    # Create default admin if doesn't exist
+    admin_salt = secrets.token_hex(16)
+    admin_password = hash_password("admin123", admin_salt)
+    try:
+        cursor.execute(
+            "INSERT INTO admin_users (username, password_hash) VALUES (?, ?)",
+            ("admin", admin_password + ":" + admin_salt)
+        )
+    except sqlite3.IntegrityError:
+        pass  # Admin already exists
+    
+    conn.commit()
+    conn.close()
+
+# Cryptographic Functions
+def hash_password(password, salt):
+    """Hash password using SHA-256 with salt"""
+    return hashlib.sha256((password + salt).encode()).hexdigest()
+
+def generate_key_pair():
+    """Generate RSA key pair (2048-bit)"""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=CONFIG["app_config"]["key_size"],
+        backend=default_backend()
+    )
+    public_key = private_key.public_key()
+    return private_key, public_key
+
+def generate_certificate(username, public_key, private_key):
+    """Generate self-signed X.509 certificate"""
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, u"NP"),
+        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"Bagmati"),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, u"Kathmandu"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"SecureChat"),
+        x509.NameAttribute(NameOID.COMMON_NAME, username),
+    ])
+    
+    cert = x509.CertificateBuilder().subject_name(
+        subject
+    ).issuer_name(
+        issuer
+    ).public_key(
+        public_key
+    ).serial_number(
+        x509.random_serial_number()
+    ).not_valid_before(
+        datetime.utcnow()
+    ).not_valid_after(
+        datetime.utcnow() + timedelta(days=CONFIG["ca_config"]["validity_days"])
+    ).add_extension(
+        x509.SubjectAlternativeName([x509.DNSName(u"localhost")]),
+        critical=False,
+    ).sign(private_key, hashes.SHA256(), default_backend())
+    
+    return cert
+
+def save_private_key(username, private_key, password):
+    """Encrypt and save private key"""
+    encryption_algorithm = serialization.BestAvailableEncryption(password.encode())
+    
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=encryption_algorithm
+    )
+    
+    key_path = os.path.join(KEYS_DIR, f"{username}_private.pem")
+    with open(key_path, 'wb') as f:
+        f.write(pem)
+
+def load_private_key(username, password):
+    """Load and decrypt private key"""
+    key_path = os.path.join(KEYS_DIR, f"{username}_private.pem")
+    try:
+        with open(key_path, 'rb') as f:
+            pem = f.read()
         
-        cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
-        user = cursor.fetchone()
-        conn.close()
-        
-        if user:
-            return {
-                'username': user[1],
-                'encrypted_private_key': user[2],
-                'salt': user[3],
-                'iv': user[4],
-                'public_key': user[5],
-                'certificate': json.loads(user[6]),
-                'security_questions': json.loads(user[7])
-            }
+        private_key = serialization.load_pem_private_key(
+            pem,
+            password=password.encode(),
+            backend=default_backend()
+        )
+        return private_key
+    except Exception as e:
         return None
+
+def public_key_from_pem(pem_string):
+    """Convert PEM string to public key object"""
+    return serialization.load_pem_public_key(
+        pem_string.encode(),
+        backend=default_backend()
+    )
+
+def encrypt_message(message, public_key_pem):
+    """Encrypt message with recipient's public key"""
+    public_key = public_key_from_pem(public_key_pem)
     
-    def get_all_users(self):
-        """Get all registered users from database"""
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT username FROM users')
-        users = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        
-        return users
+    # For longer messages, we'd use hybrid encryption (AES + RSA)
+    # For simplicity, using RSA directly (limited to key_size/8 - padding bytes)
+    ciphertext = public_key.encrypt(
+        message.encode(),
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return b64encode(ciphertext).decode()
+
+def decrypt_message(encrypted_message, private_key):
+    """Decrypt message with recipient's private key"""
+    ciphertext = b64decode(encrypted_message.encode())
     
-    def save_message(self, sender, receiver, message, encrypted=True, signed=True, signature=None):
-        """Save message to database"""
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO messages (sender, receiver, message, encrypted, signed, signature)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (sender, receiver, message, 1 if encrypted else 0, 1 if signed else 0, signature))
-        
-        conn.commit()
-        conn.close()
+    plaintext = private_key.decrypt(
+        ciphertext,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return plaintext.decode()
+
+def sign_message(message, private_key):
+    """Create digital signature for message"""
+    signature = private_key.sign(
+        message.encode(),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH
+        ),
+        hashes.SHA256()
+    )
+    return b64encode(signature).decode()
+
+def verify_signature(message, signature_b64, public_key_pem):
+    """Verify digital signature"""
+    public_key = public_key_from_pem(public_key_pem)
+    signature = b64decode(signature_b64.encode())
     
-    def get_messages(self, user1, user2):
-        """Get conversation between two users"""
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT * FROM messages 
-            WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
-            ORDER BY timestamp
-        ''', (user1, user2, user2, user1))
-        
-        messages = cursor.fetchall()
-        conn.close()
-        return messages
-    
-    def verify_admin(self, email, password):
-        """Verify admin credentials"""
-        conn = sqlite3.connect(self.db_file)
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT password_hash, salt FROM admin WHERE email = ?', (email,))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            stored_hash = base64.b64decode(result[0])
-            salt = base64.b64decode(result[1])
-            
-            computed_hash = hashlib.pbkdf2_hmac(
-                'sha256',
-                password.encode(),
-                salt,
-                100000
-            )
-            
-            return stored_hash == computed_hash
-        
+    try:
+        public_key.verify(
+            signature,
+            message.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return True
+    except Exception:
         return False
 
-# ====================== JSON STORAGE ======================
-class JSONStorage:
-    def __init__(self, filename="users.json"):
-        self.filename = filename
-        self.data = self.load_data()
-    
-    def load_data(self):
-        """Load data from JSON file"""
-        if os.path.exists(self.filename):
-            try:
-                with open(self.filename, 'r') as f:
-                    return json.load(f)
-            except:
-                return {"users": {}, "admin": {"email": "admin@gmail.com", "password": "admin123@"}}
-        return {"users": {}, "admin": {"email": "admin@gmail.com", "password": "admin123@"}}
-    
-    def save_data(self):
-        """Save data to JSON file"""
-        with open(self.filename, 'w') as f:
-            json.dump(self.data, f, indent=4)
-    
-    def save_user(self, username, user_data):
-        """Save user to JSON"""
-        self.data["users"][username] = user_data
-        self.save_data()
-    
-    def get_user(self, username):
-        """Get user from JSON"""
-        return self.data["users"].get(username)
+# Authentication decorators
+def login_required(f):
+    """Decorator to require user login"""
+    @functools.wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Please log in to access this page', 'error')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
 
-# ====================== STYLES AND COLORS ======================
-class Styles:
-    # Color Scheme
-    PRIMARY = "#2C3E50"      # Dark blue
-    SECONDARY = "#3498DB"    # Blue
-    SUCCESS = "#2ECC71"      # Green
-    DANGER = "#E74C3C"       # Red
-    WARNING = "#F39C12"      # Orange
-    INFO = "#9B59B6"         # Purple
-    LIGHT = "#ECF0F1"        # Light gray
-    DARK = "#2C3E50"         # Dark
-    BG = "#34495E"           # Background
-    CARD_BG = "#2C3E50"      # Card background
+def admin_required(f):
+    """Decorator to require admin login"""
+    @functools.wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'admin_id' not in session:
+            flash('Admin access required', 'error')
+            return redirect(url_for('admin_login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# HTML Templates
+HOME_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SecureChat - Home</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            text-align: center;
+        }
+        h1 {
+            color: #2d3748;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+        .subtitle {
+            color: #718096;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+        .btn {
+            display: block;
+            width: 100%;
+            padding: 15px;
+            margin: 10px 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-decoration: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            transition: transform 0.2s;
+            border: none;
+            cursor: pointer;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        .btn-secondary {
+            background: linear-gradient(135deg, #4c51bf 0%, #434190 100%);
+        }
+        .icon { font-size: 4em; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🔐</div>
+        <h1>SecureChat</h1>
+        <p class="subtitle">PKI-Based Encrypted Messaging</p>
+        <a href="{{ url_for('register') }}" class="btn">Register New Account</a>
+        <a href="{{ url_for('login') }}" class="btn">Login</a>
+        <a href="{{ url_for('admin_login') }}" class="btn btn-secondary">Admin Panel</a>
+    </div>
+</body>
+</html>
+'''
+
+REGISTER_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Register - SecureChat</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 600px;
+            margin: 20px auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #2d3748;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            color: #4a5568;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+        input, select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        input:focus, select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        .alert {
+            padding: 12px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            font-weight: 500;
+        }
+        .alert-error {
+            background: #fee;
+            color: #c53030;
+            border: 1px solid #fc8181;
+        }
+        .alert-success {
+            background: #f0fff4;
+            color: #22543d;
+            border: 1px solid #48bb78;
+        }
+        .back-link {
+            display: block;
+            text-align: center;
+            margin-top: 20px;
+            color: #667eea;
+            text-decoration: none;
+        }
+        .info-box {
+            background: #ebf8ff;
+            border-left: 4px solid #4299e1;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Register Account</h1>
+        
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        
+        <div class="info-box">
+            <strong>Note:</strong> Your RSA key pair (2048-bit) and digital certificate will be automatically generated upon registration.
+        </div>
+        
+        <form method="POST">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" required minlength="3">
+            </div>
+            
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" required minlength="6">
+            </div>
+            
+            <div class="form-group">
+                <label>Confirm Password</label>
+                <input type="password" name="confirm_password" required>
+            </div>
+            
+            <div class="form-group">
+                <label>Security Question 1</label>
+                <select name="security_q1" required>
+                    <option value="">Select a question</option>
+                    <option value="What was your childhood nickname?">What was your childhood nickname?</option>
+                    <option value="What is your mother's maiden name?">What is your mother's maiden name?</option>
+                    <option value="What was the name of your first pet?">What was the name of your first pet?</option>
+                    <option value="What city were you born in?">What city were you born in?</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label>Answer 1</label>
+                <input type="text" name="security_a1" required>
+            </div>
+            
+            <div class="form-group">
+                <label>Security Question 2</label>
+                <select name="security_q2" required>
+                    <option value="">Select a question</option>
+                    <option value="What is your favorite book?">What is your favorite book?</option>
+                    <option value="What was your first car?">What was your first car?</option>
+                    <option value="What is your favorite food?">What is your favorite food?</option>
+                    <option value="What was your high school mascot?">What was your high school mascot?</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label>Answer 2</label>
+                <input type="text" name="security_a2" required>
+            </div>
+            
+            <button type="submit" class="btn">Register</button>
+        </form>
+        
+        <a href="{{ url_for('index') }}" class="back-link">← Back to Home</a>
+    </div>
+</body>
+</html>
+'''
+
+LOGIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login - SecureChat</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 450px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #2d3748;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            color: #4a5568;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        .alert {
+            padding: 12px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            font-weight: 500;
+        }
+        .alert-error {
+            background: #fee;
+            color: #c53030;
+            border: 1px solid #fc8181;
+        }
+        .links {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .links a {
+            color: #667eea;
+            text-decoration: none;
+            margin: 0 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Login</h1>
+        
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        
+        <form method="POST">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" required>
+            </div>
+            
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" required>
+            </div>
+            
+            <button type="submit" class="btn">Login</button>
+        </form>
+        
+        <div class="links">
+            <a href="{{ url_for('forgot_password') }}">Forgot Password?</a>
+            <a href="{{ url_for('index') }}">← Back</a>
+        </div>
+    </div>
+    <script>
+        // If the flash message contains "locked", start a 10-minute countdown
+        var flashEl = document.querySelector('.alert-error');
+        if (flashEl && flashEl.textContent.indexOf('locked') !== -1) {
+            var seconds = 600; // 10 minutes
+            var timerDiv = document.createElement('div');
+            timerDiv.style.cssText = 'text-align:center;margin-top:18px;padding:12px;background:#fff5f5;border-radius:8px;color:#c53030;font-weight:600;font-size:15px;';
+            timerDiv.innerHTML = '🔒 Account locked. Unlocking in <span id="countdown">10:00</span>…';
+            document.querySelector('.container').appendChild(timerDiv);
+
+            var interval = setInterval(function () {
+                seconds--;
+                if (seconds <= 0) {
+                    clearInterval(interval);
+                    timerDiv.innerHTML = '✅ Lockout expired. You may try again.';
+                    timerDiv.style.background = '#f0fff4';
+                    timerDiv.style.color = '#22543d';
+                    return;
+                }
+                var m = Math.floor(seconds / 60);
+                var s = seconds % 60;
+                document.getElementById('countdown').textContent = m + ':' + (s < 10 ? '0' : '') + s;
+            }, 1000);
+        }
+    </script>
+</body>
+</html>
+'''
+
+FORGOT_PASSWORD_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Forgot Password - SecureChat</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            margin: 50px auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 { color: #2d3748; margin-bottom: 30px; text-align: center; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; color: #4a5568; margin-bottom: 5px; font-weight: 600; }
+        input { width: 100%; padding: 12px; border: 2px solid #e2e8f0; border-radius: 8px; font-size: 14px; }
+        input:focus { outline: none; border-color: #667eea; }
+        .btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .alert { padding: 12px; margin-bottom: 20px; border-radius: 8px; font-weight: 500; }
+        .alert-error { background: #fee; color: #c53030; border: 1px solid #fc8181; }
+        .alert-success { background: #f0fff4; color: #22543d; border: 1px solid #48bb78; }
+        .back-link { display: block; text-align: center; margin-top: 20px; color: #667eea; text-decoration: none; }
+        .step { display: none; }
+        .step.active { display: block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔑 Password Recovery</h1>
+        
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        
+        <form method="POST">
+            {% if not security_questions %}
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" required>
+            </div>
+            <button type="submit" class="btn">Continue</button>
+            {% else %}
+            <input type="hidden" name="username" value="{{ username }}">
+            <div class="form-group">
+                <label>{{ security_questions[0] }}</label>
+                <input type="text" name="answer1" required>
+            </div>
+            <div class="form-group">
+                <label>{{ security_questions[1] }}</label>
+                <input type="text" name="answer2" required>
+            </div>
+            <div class="form-group">
+                <label>New Password</label>
+                <input type="password" name="new_password" required minlength="6">
+            </div>
+            <button type="submit" class="btn">Reset Password</button>
+            {% endif %}
+        </form>
+        
+        <a href="{{ url_for('login') }}" class="back-link">← Back to Login</a>
+    </div>
+</body>
+</html>
+'''
+
+DASHBOARD_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard - SecureChat</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .header {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .header h1 { color: #2d3748; }
+        .header .user-info { color: #4a5568; }
+        .btn-logout {
+            padding: 10px 20px;
+            background: #fc8181;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .users-panel, .chat-panel {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+        }
+        .users-panel h2, .chat-panel h2 {
+            color: #2d3748;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        .user-item {
+            padding: 15px;
+            margin: 10px 0;
+            background: #f7fafc;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-left: 4px solid transparent;
+        }
+        .user-item:hover {
+            background: #edf2f7;
+            border-left-color: #667eea;
+            transform: translateX(5px);
+        }
+        .user-item.active {
+            background: #ebf8ff;
+            border-left-color: #4299e1;
+        }
+        .chat-area {
+            height: 400px;
+            overflow-y: auto;
+            border: 2px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            background: #f7fafc;
+        }
+        .message {
+            margin: 15px 0;
+            padding: 12px 15px;
+            border-radius: 10px;
+            max-width: 80%;
+        }
+        .message-sent {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin-left: auto;
+            text-align: right;
+        }
+        .message-received {
+            background: #e2e8f0;
+            color: #2d3748;
+        }
+        .message-meta {
+            font-size: 0.85em;
+            opacity: 0.8;
+            margin-top: 5px;
+        }
+        .compose-area {
+            display: flex;
+            gap: 10px;
+        }
+        .compose-area textarea {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #e2e8f0;
+            border-radius: 10px;
+            resize: none;
+            font-family: inherit;
+        }
+        .compose-area textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn-send {
+            padding: 12px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        .empty-state {
+            text-align: center;
+            color: #718096;
+            padding: 60px 20px;
+        }
+        .signature-badge {
+            display: inline-block;
+            padding: 3px 8px;
+            background: #48bb78;
+            color: white;
+            border-radius: 4px;
+            font-size: 0.75em;
+            margin-left: 5px;
+        }
+        .signature-badge.invalid {
+            background: #fc8181;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>🔐 SecureChat Dashboard</h1>
+            <div class="user-info">Logged in as: <strong>{{ username }}</strong></div>
+        </div>
+        <a href="{{ url_for('logout') }}" class="btn-logout">Logout</a>
+    </div>
     
-    # Fonts
-    TITLE_FONT = ("Segoe UI", 24, "bold")
-    HEADING_FONT = ("Segoe UI", 16, "bold")
-    SUBHEADING_FONT = ("Segoe UI", 12, "bold")
-    BODY_FONT = ("Segoe UI", 10)
-    MONO_FONT = ("Consolas", 9)
+    <div class="container">
+        <div class="users-panel">
+            <h2>👥 Users</h2>
+            {% for user in users %}
+                {% if user.user_id != current_user_id %}
+                <div class="user-item" onclick="selectUser({{ user.user_id }}, '{{ user.username }}')">
+                    <strong>{{ user.username }}</strong>
+                    <div style="font-size: 0.85em; color: #718096;">
+                        Joined: {{ user.created_at[:10] }}
+                    </div>
+                </div>
+                {% endif %}
+            {% endfor %}
+        </div>
+        
+        <div class="chat-panel">
+            <h2 id="chat-title">💬 Select a user to start chatting</h2>
+            <div id="chat-area" class="chat-area">
+                <div class="empty-state">
+                    <div style="font-size: 3em; margin-bottom: 10px;">💬</div>
+                    <p>Select a user from the left panel to view messages</p>
+                </div>
+            </div>
+            <div class="compose-area" id="compose-area" style="display: none;">
+                <textarea id="message-input" rows="3" placeholder="Type your message (max 190 characters for RSA encryption)..."></textarea>
+                <button class="btn-send" onclick="sendMessage()">Send 🔒</button>
+            </div>
+        </div>
+    </div>
     
-    # Button Styles
-    BTN_PRIMARY = {"bg": SECONDARY, "fg": "white", "font": ("Segoe UI", 10, "bold")}
-    BTN_SUCCESS = {"bg": SUCCESS, "fg": "white", "font": ("Segoe UI", 10, "bold")}
-    BTN_DANGER = {"bg": DANGER, "fg": "white", "font": ("Segoe UI", 10, "bold")}
-    BTN_WARNING = {"bg": WARNING, "fg": "white", "font": ("Segoe UI", 10, "bold")}
-    BTN_INFO = {"bg": INFO, "fg": "white", "font": ("Segoe UI", 10, "bold")}
-    
-    @staticmethod
-    def create_rounded_button(parent, text, command, style="primary", width=15):
-        """Create a styled rounded button"""
-        styles = {
-            "primary": Styles.BTN_PRIMARY,
-            "success": Styles.BTN_SUCCESS,
-            "danger": Styles.BTN_DANGER,
-            "warning": Styles.BTN_WARNING,
-            "info": Styles.BTN_INFO
+    <script>
+        let selectedUserId = null;
+        let selectedUsername = '';
+        
+        function selectUser(userId, username) {
+            selectedUserId = userId;
+            selectedUsername = username;
+            
+            // Update UI
+            document.querySelectorAll('.user-item').forEach(item => {
+                item.classList.remove('active');
+            });
+            event.currentTarget.classList.add('active');
+            
+            document.getElementById('chat-title').innerHTML = '💬 Chat with ' + username;
+            document.getElementById('compose-area').style.display = 'flex';
+            
+            loadMessages(userId);
         }
         
-        btn_style = styles.get(style, Styles.BTN_PRIMARY)
-        btn = tk.Button(
-            parent,
-            text=text,
-            command=command,
-            **btn_style,
-            relief="flat",
-            bd=0,
-            padx=20,
-            pady=8,
-            cursor="hand2",
-            width=width
-        )
-        btn.config(activebackground=btn_style["bg"], activeforeground=btn_style["fg"])
-        return btn
+        function loadMessages(userId) {
+            fetch('/get_messages?user_id=' + userId)
+                .then(response => response.json())
+                .then(data => {
+                    const chatArea = document.getElementById('chat-area');
+                    if (data.messages.length === 0) {
+                        chatArea.innerHTML = '<div class="empty-state"><div style="font-size: 3em;">📭</div><p>No messages yet. Start the conversation!</p></div>';
+                    } else {
+                        chatArea.innerHTML = data.messages.map(msg => {
+                            const isSent = msg.is_sent;
+                            const className = isSent ? 'message-sent' : 'message-received';
+                            const signatureBadge = msg.signature_valid ? 
+                                '<span class="signature-badge">✓ Verified</span>' : 
+                                '<span class="signature-badge invalid">⚠ Invalid Signature</span>';
+                            
+                            return `
+                                <div class="message ${className}">
+                                    <div>${msg.decrypted_message}</div>
+                                    <div class="message-meta">
+                                        ${msg.timestamp} ${signatureBadge}
+                                    </div>
+                                </div>
+                            `;
+                        }).join('');
+                        chatArea.scrollTop = chatArea.scrollHeight;
+                    }
+                });
+        }
+        
+        function sendMessage() {
+            const messageInput = document.getElementById('message-input');
+            const message = messageInput.value.trim();
+            
+            if (!message || !selectedUserId) {
+                alert('Please enter a message');
+                return;
+            }
+            
+            if (message.length > 190) {
+                alert('Message too long for RSA encryption. Please keep under 190 characters.');
+                return;
+            }
+            
+            fetch('/send_message', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    recipient_id: selectedUserId,
+                    message: message
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    messageInput.value = '';
+                    loadMessages(selectedUserId);
+                } else {
+                    alert('Failed to send message: ' + data.error);
+                }
+            });
+        }
+        
+        // Auto-refresh messages every 5 seconds
+        setInterval(() => {
+            if (selectedUserId) {
+                loadMessages(selectedUserId);
+            }
+        }, 5000);
+    </script>
+</body>
+</html>
+'''
 
-# ====================== CORE SECURITY CLASSES ======================
-class CertificateAuthority:
-    def __init__(self):
-        self.ca_private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-            backend=default_backend()
-        )
-        self.ca_public_key = self.ca_private_key.public_key()
-        self.certificates = {}
-        self.revoked_certificates = set()
+ADMIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Admin Panel - SecureChat</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #2d3748 0%, #1a202c 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .header {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { color: #2d3748; }
+        .btn-logout {
+            padding: 10px 20px;
+            background: #fc8181;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+        }
+        .stat-card h3 {
+            color: #718096;
+            font-size: 0.9em;
+            margin-bottom: 10px;
+        }
+        .stat-card .value {
+            color: #2d3748;
+            font-size: 2.5em;
+            font-weight: bold;
+        }
+        .panel {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+        }
+        .panel h2 {
+            color: #2d3748;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        th {
+            background: #f7fafc;
+            color: #4a5568;
+            font-weight: 600;
+        }
+        .btn-action {
+            padding: 6px 12px;
+            margin: 0 2px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+        .btn-view {
+            background: #4299e1;
+            color: white;
+        }
+        .btn-disable {
+            background: #fc8181;
+            color: white;
+        }
+        .btn-enable {
+            background: #48bb78;
+            color: white;
+        }
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.7);
+            justify-content: center;
+            align-items: center;
+        }
+        .modal.active {
+            display: flex;
+        }
+        .modal-content {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            max-width: 800px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .modal-content h3 {
+            margin-bottom: 20px;
+            color: #2d3748;
+        }
+        .close-modal {
+            float: right;
+            font-size: 1.5em;
+            cursor: pointer;
+            color: #718096;
+        }
+        .cert-data {
+            background: #f7fafc;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            word-break: break-all;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>⚙️ Admin Panel</h1>
+        <a href="{{ url_for('admin_logout') }}" class="btn-logout">Logout</a>
+    </div>
     
-    def issue_certificate(self, user_id, public_key):
-        """Issue a digital certificate for a user"""
-        cert_data = {
-            'user_id': user_id,
-            'public_key': public_key.public_bytes(
+    <div class="stats">
+        <div class="stat-card">
+            <h3>TOTAL USERS</h3>
+            <div class="value">{{ stats.total_users }}</div>
+        </div>
+        <div class="stat-card">
+            <h3>ACTIVE USERS</h3>
+            <div class="value">{{ stats.active_users }}</div>
+        </div>
+        <div class="stat-card">
+            <h3>TOTAL MESSAGES</h3>
+            <div class="value">{{ stats.total_messages }}</div>
+        </div>
+    </div>
+    
+    <div class="panel">
+        <h2>👥 User Management</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Username</th>
+                    <th>Registered</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for user in users %}
+                <tr>
+                    <td>{{ user.user_id }}</td>
+                    <td>{{ user.username }}</td>
+                    <td>{{ user.created_at[:16] }}</td>
+                    <td>
+                        {% if user.is_active %}
+                            <span style="color: #48bb78;">● Active</span>
+                        {% else %}
+                            <span style="color: #fc8181;">● Disabled</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <button class="btn-action btn-view" onclick="viewCertificate({{ user.user_id }})">View Certificate</button>
+                        {% if user.is_active %}
+                            <button class="btn-action btn-disable" onclick="toggleUser({{ user.user_id }}, 0)">Disable</button>
+                        {% else %}
+                            <button class="btn-action btn-enable" onclick="toggleUser({{ user.user_id }}, 1)">Enable</button>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    
+    <div class="panel">
+        <h2>📊 Message Activity</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>From</th>
+                    <th>To</th>
+                    <th>Timestamp</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for msg in messages %}
+                <tr>
+                    <td>{{ msg.message_id }}</td>
+                    <td>{{ msg.sender_username }}</td>
+                    <td>{{ msg.recipient_username }}</td>
+                    <td>{{ msg.timestamp[:16] }}</td>
+                    <td>
+                        {% if msg.is_read %}
+                            <span style="color: #48bb78;">Read</span>
+                        {% else %}
+                            <span style="color: #718096;">Unread</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    
+    <div class="modal" id="certModal">
+        <div class="modal-content">
+            <span class="close-modal" onclick="closeModal()">×</span>
+            <h3 id="modalTitle">Certificate Details</h3>
+            <div>
+                <strong>Public Key:</strong>
+                <div class="cert-data" id="publicKeyData"></div>
+            </div>
+            <div>
+                <strong>Certificate:</strong>
+                <div class="cert-data" id="certificateData"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function viewCertificate(userId) {
+            fetch('/admin/get_certificate?user_id=' + userId)
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('modalTitle').textContent = 'Certificate: ' + data.username;
+                    document.getElementById('publicKeyData').textContent = data.public_key;
+                    document.getElementById('certificateData').textContent = data.certificate;
+                    document.getElementById('certModal').classList.add('active');
+                })
+                .catch(err => {
+                    alert('Failed to load certificate: ' + err);
+                });
+        }
+        
+        function closeModal() {
+            document.getElementById('certModal').classList.remove('active');
+        }
+        
+        // Close modal when clicking outside it
+        document.getElementById('certModal').addEventListener('click', function(e) {
+            if (e.target === this) closeModal();
+        });
+        
+        function toggleUser(userId, status) {
+            fetch('/admin/toggle_user', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    user_id: userId,
+                    is_active: status
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                }
+            });
+        }
+    </script>
+</body>
+</html>
+'''
+
+# Routes
+@app.route('/')
+def index():
+    """Home page"""
+    return render_template_string(HOME_TEMPLATE)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    """User registration with key generation and certificate issuance"""
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        confirm_password = request.form['confirm_password']
+        security_q1 = request.form['security_q1']
+        security_a1 = request.form['security_a1']
+        security_q2 = request.form['security_q2']
+        security_a2 = request.form['security_a2']
+        
+        # Validation
+        if password != confirm_password:
+            flash('Passwords do not match', 'error')
+            return render_template_string(REGISTER_TEMPLATE)
+        
+        if len(password) < 6:
+            flash('Password must be at least 6 characters', 'error')
+            return render_template_string(REGISTER_TEMPLATE)
+        
+        # Check if username exists
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE username = ?", (username,))
+        if cursor.fetchone():
+            flash('Username already exists', 'error')
+            conn.close()
+            return render_template_string(REGISTER_TEMPLATE)
+        
+        try:
+            # Generate cryptographic materials
+            private_key, public_key = generate_key_pair()
+            certificate = generate_certificate(username, public_key, private_key)
+            
+            # Serialize public key and certificate
+            public_key_pem = public_key.public_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ).decode('utf-8'),
-            'issue_date': datetime.now().isoformat(),
-            'expiry_date': (datetime.now() + timedelta(days=365)).isoformat(),
-            'ca_signature': None,
-            'serial_number': secrets.token_hex(16)
-        }
-        
-        # Sign the certificate
-        data_to_sign = json.dumps({
-            'user_id': cert_data['user_id'],
-            'public_key': cert_data['public_key'],
-            'issue_date': cert_data['issue_date'],
-            'expiry_date': cert_data['expiry_date'],
-            'serial_number': cert_data['serial_number']
-        }, sort_keys=True).encode('utf-8')
-        
-        signature = self.ca_private_key.sign(
-            data_to_sign,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        
-        cert_data['ca_signature'] = base64.b64encode(signature).decode('utf-8')
-        self.certificates[user_id] = cert_data
-        return cert_data
+            ).decode()
+            
+            certificate_pem = certificate.public_bytes(
+                encoding=serialization.Encoding.PEM
+            ).decode()
+            
+            # Save private key (encrypted with password)
+            save_private_key(username, private_key, password)
+            
+            # Hash password and security answers
+            salt = secrets.token_hex(16)
+            password_hash = hash_password(password, salt)
+            
+            answer1_salt = secrets.token_hex(16)
+            answer1_hash = hash_password(security_a1.lower(), answer1_salt)
+            
+            answer2_salt = secrets.token_hex(16)
+            answer2_hash = hash_password(security_a2.lower(), answer2_salt)
+            
+            # Store in database
+            cursor.execute('''
+                INSERT INTO users (
+                    username, password_hash, salt, public_key, certificate,
+                    security_q1, security_a1_hash, security_q2, security_a2_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                username, password_hash, salt, public_key_pem, certificate_pem,
+                security_q1, answer1_hash + ":" + answer1_salt,
+                security_q2, answer2_hash + ":" + answer2_salt
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            flash('Registration successful! Your RSA key pair and certificate have been generated.', 'success')
+            return redirect(url_for('login'))
+            
+        except Exception as e:
+            flash(f'Registration failed: {str(e)}', 'error')
+            conn.close()
+            return render_template_string(REGISTER_TEMPLATE)
     
-    def verify_certificate(self, cert_data):
-        """Verify certificate signature"""
-        if cert_data['user_id'] not in self.certificates:
-            return False
-        
-        # Check if revoked
-        if cert_data['serial_number'] in self.revoked_certificates:
-            return False
-        
-        # Check expiry
-        expiry_date = datetime.fromisoformat(cert_data['expiry_date'])
-        if datetime.now() > expiry_date:
-            return False
-        
-        # Verify signature
-        data_to_verify = json.dumps({
-            'user_id': cert_data['user_id'],
-            'public_key': cert_data['public_key'],
-            'issue_date': cert_data['issue_date'],
-            'expiry_date': cert_data['expiry_date'],
-            'serial_number': cert_data['serial_number']
-        }, sort_keys=True).encode('utf-8')
-        
-        signature = base64.b64decode(cert_data['ca_signature'])
-        
-        try:
-            self.ca_public_key.verify(
-                signature,
-                data_to_verify,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-            return True
-        except:
-            return False
+    return render_template_string(REGISTER_TEMPLATE)
 
-class SecureUser:
-    def __init__(self, username):
-        self.username = username
-        self.private_key = None
-        self.public_key = None
-        self.certificate = None
-        self.security_questions = {}
-        self.encrypted_private_key = None
-        self.salt = None
-        self.iv = None
-    
-    def generate_key_pair(self, password):
-        """Generate RSA key pair and encrypt private key with password"""
-        self.private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-            backend=default_backend()
-        )
-        self.public_key = self.private_key.public_key()
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """User login with certificate validation and 3-strike lockout (10 min)"""
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
         
-        # Serialize private key
-        private_key_pem = self.private_key.private_bytes(
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+
+        # ----------------------------------------------------------
+        # 1. Check / initialise the login_attempts row for this user
+        # ----------------------------------------------------------
+        cursor.execute(
+            "SELECT failed_attempts, locked, locked_at FROM login_attempts WHERE username = ?",
+            (username,)
+        )
+        attempt_row = cursor.fetchone()
+
+        if attempt_row is None:
+            # First-ever attempt for this username – create the row
+            cursor.execute(
+                "INSERT INTO login_attempts (username, failed_attempts, locked, locked_at) VALUES (?, 0, 0, NULL)",
+                (username,)
+            )
+            conn.commit()
+            failed_attempts, locked, locked_at = 0, 0, None
+        else:
+            failed_attempts, locked, locked_at = attempt_row
+
+        # ----------------------------------------------------------
+        # 2. If account is locked, check whether the 10-min window
+        #    has passed; if not, reject immediately.
+        # ----------------------------------------------------------
+        if locked and locked_at:
+            locked_time = datetime.strptime(locked_at, "%Y-%m-%d %H:%M:%S.%f") if '.' in locked_at else datetime.strptime(locked_at, "%Y-%m-%d %H:%M:%S")
+            remaining = 600 - (datetime.utcnow() - locked_time).total_seconds()  # 600 s = 10 min
+
+            if remaining > 0:
+                mins = int(remaining // 60) + 1          # round up to next whole minute
+                flash(f'Account is locked. Please wait {mins} minute(s) before trying again.', 'error')
+                conn.close()
+                return render_template_string(LOGIN_TEMPLATE)
+            else:
+                # Lockout expired – reset the row
+                cursor.execute(
+                    "UPDATE login_attempts SET failed_attempts = 0, locked = 0, locked_at = NULL WHERE username = ?",
+                    (username,)
+                )
+                conn.commit()
+                failed_attempts = 0
+
+        # ----------------------------------------------------------
+        # 3. Look up the user record
+        # ----------------------------------------------------------
+        cursor.execute(
+            "SELECT user_id, password_hash, salt, is_active FROM users WHERE username = ?",
+            (username,)
+        )
+        user = cursor.fetchone()
+
+        if not user:
+            # Username doesn't exist – don't reveal that; just say invalid
+            flash('Invalid username or password', 'error')
+            conn.close()
+            return render_template_string(LOGIN_TEMPLATE)
+
+        user_id, stored_hash, salt, is_active = user
+
+        if not is_active:
+            flash('Your account has been disabled. Contact administrator.', 'error')
+            conn.close()
+            return render_template_string(LOGIN_TEMPLATE)
+
+        # ----------------------------------------------------------
+        # 4. Verify password
+        # ----------------------------------------------------------
+        if hash_password(password, salt) != stored_hash:
+            # Wrong password – increment counter
+            failed_attempts += 1
+
+            if failed_attempts >= 3:
+                # Lock the account for 10 minutes
+                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute(
+                    "UPDATE login_attempts SET failed_attempts = ?, locked = 1, locked_at = ? WHERE username = ?",
+                    (failed_attempts, now, username)
+                )
+                conn.commit()
+                conn.close()
+                flash('Too many failed attempts. Your account is now locked for 10 minutes.', 'error')
+                return render_template_string(LOGIN_TEMPLATE)
+            else:
+                # Save incremented counter, show remaining attempts
+                cursor.execute(
+                    "UPDATE login_attempts SET failed_attempts = ? WHERE username = ?",
+                    (failed_attempts, username)
+                )
+                conn.commit()
+                conn.close()
+                remaining_tries = 3 - failed_attempts
+                flash(f'Invalid username or password. {remaining_tries} attempt(s) remaining before lockout.', 'error')
+                return render_template_string(LOGIN_TEMPLATE)
+
+        # ----------------------------------------------------------
+        # 5. Password correct – verify private key (certificate check)
+        # ----------------------------------------------------------
+        private_key = load_private_key(username, password)
+        if not private_key:
+            flash('Certificate validation failed', 'error')
+            conn.close()
+            return render_template_string(LOGIN_TEMPLATE)
+
+        # ----------------------------------------------------------
+        # 6. Login successful – reset attempts, build session
+        # ----------------------------------------------------------
+        cursor.execute(
+            "UPDATE login_attempts SET failed_attempts = 0, locked = 0, locked_at = NULL WHERE username = ?",
+            (username,)
+        )
+        conn.commit()
+        conn.close()
+
+        private_key_pem = private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption()
-        )
+        ).decode()
+
+        session['user_id'] = user_id
+        session['username'] = username
+        session['private_key_pem'] = private_key_pem
+        flash('Login successful!', 'success')
+        return redirect(url_for('dashboard'))
+
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route('/forgot_password', methods=['GET', 'POST'])
+def forgot_password():
+    """Password recovery using security questions"""
+    if request.method == 'POST':
+        username = request.form.get('username')
         
-        # Encrypt private key
-        self.encrypted_private_key, self.salt, self.iv = self._encrypt_with_password(
-            private_key_pem, password
-        )
+        # Step 1: Get security questions
+        if 'answer1' not in request.form:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT security_q1, security_q2 FROM users WHERE username = ?",
+                (username,)
+            )
+            result = cursor.fetchone()
+            conn.close()
+            
+            if not result:
+                flash('Username not found', 'error')
+                return render_template_string(FORGOT_PASSWORD_TEMPLATE)
+            
+            return render_template_string(
+                FORGOT_PASSWORD_TEMPLATE,
+                security_questions=result,
+                username=username
+            )
         
-        return self.public_key
+        # Step 2: Verify answers and reset password
+        else:
+            answer1 = request.form['answer1']
+            answer2 = request.form['answer2']
+            new_password = request.form['new_password']
+            
+            conn = sqlite3.connect(DATABASE_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT security_a1_hash, security_a2_hash, public_key FROM users WHERE username = ?",
+                (username,)
+            )
+            result = cursor.fetchone()
+            
+            if not result:
+                flash('User not found', 'error')
+                conn.close()
+                return redirect(url_for('forgot_password'))
+            
+            stored_a1, stored_a2, public_key_pem = result
+            
+            # Verify answers
+            hash1, salt1 = stored_a1.split(':')
+            hash2, salt2 = stored_a2.split(':')
+            
+            if (hash_password(answer1.lower(), salt1) != hash1 or
+                hash_password(answer2.lower(), salt2) != hash2):
+                flash('Security answers incorrect', 'error')
+                conn.close()
+                return redirect(url_for('forgot_password'))
+            
+            # Update password
+            new_salt = secrets.token_hex(16)
+            new_hash = hash_password(new_password, new_salt)
+            
+            cursor.execute(
+                "UPDATE users SET password_hash = ?, salt = ? WHERE username = ?",
+                (new_hash, new_salt, username)
+            )
+            conn.commit()
+            conn.close()
+            
+            # Note: Private key needs to be regenerated as it was encrypted with old password
+            # For simplicity, we're not implementing this here - in production,
+            # you'd need to re-encrypt the private key with the new password
+            
+            flash('Password reset successful! Please login with your new password.', 'success')
+            return redirect(url_for('login'))
     
-    def _encrypt_with_password(self, data, password):
-        """Encrypt data with password using AES-CBC"""
-        salt = os.urandom(16)
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-            backend=default_backend()
-        )
-        key = kdf.derive(password.encode())
-        
-        iv = os.urandom(16)
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-        
-        # Pad the data
-        padder = sym_padding.PKCS7(algorithms.AES.block_size).padder()
-        padded_data = padder.update(data) + padder.finalize()
-        
-        encryptor = cipher.encryptor()
-        encrypted = encryptor.update(padded_data) + encryptor.finalize()
-        
-        return (
-            base64.b64encode(encrypted).decode('utf-8'),
-            base64.b64encode(salt).decode('utf-8'),
-            base64.b64encode(iv).decode('utf-8')
-        )
+    return render_template_string(FORGOT_PASSWORD_TEMPLATE)
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    """User dashboard with messaging interface"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
     
-    def load_private_key(self, password):
-        """Load private key from encrypted storage"""
+    # Get all users except current user
+    cursor.execute(
+        "SELECT user_id, username, created_at FROM users WHERE is_active = 1"
+    )
+    users = [dict(zip(['user_id', 'username', 'created_at'], row)) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        username=session['username'],
+        current_user_id=session['user_id'],
+        users=users
+    )
+
+@app.route('/get_messages')
+@login_required
+def get_messages():
+    """Get messages between current user and selected user"""
+    other_user_id = request.args.get('user_id', type=int)
+    current_user_id = session['user_id']
+    
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Get messages
+    cursor.execute('''
+        SELECT m.message_id, m.sender_id, m.recipient_id, m.encrypted_message,
+               m.digital_signature, m.timestamp, m.is_read,
+               s.username as sender_username, s.public_key as sender_public_key
+        FROM messages m
+        JOIN users s ON m.sender_id = s.user_id
+        WHERE (m.sender_id = ? AND m.recipient_id = ?) OR
+              (m.sender_id = ? AND m.recipient_id = ?)
+        ORDER BY m.timestamp ASC
+    ''', (current_user_id, other_user_id, other_user_id, current_user_id))
+    
+    messages = cursor.fetchall()
+    conn.close()
+    
+    # Load private key from session
+    private_key_pem = session.get('private_key_pem')
+    if not private_key_pem:
+        return jsonify({'messages': [], 'error': 'Session expired'})
+    
+    private_key = serialization.load_pem_private_key(
+        private_key_pem.encode(),
+        password=None,
+        backend=default_backend()
+    )
+    
+    result = []
+    for msg in messages:
+        msg_id, sender_id, recipient_id, encrypted_msg, signature, timestamp, is_read, sender_username, sender_public_key = msg
+        
+        is_sent = sender_id == current_user_id
+        
+        # Decrypt message if current user is recipient
         try:
-            encrypted_bytes = base64.b64decode(self.encrypted_private_key)
-            salt_bytes = base64.b64decode(self.salt)
-            iv_bytes = base64.b64decode(self.iv)
+            if recipient_id == current_user_id:
+                decrypted = decrypt_message(encrypted_msg, private_key)
+            else:
+                # For sent messages, we can't decrypt them (encrypted with recipient's key)
+                decrypted = "[Sent - Encrypted with recipient's key]"
             
-            kdf = PBKDF2HMAC(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=salt_bytes,
-                iterations=100000,
-                backend=default_backend()
-            )
-            key = kdf.derive(password.encode())
-            
-            cipher = Cipher(algorithms.AES(key), modes.CBC(iv_bytes), backend=default_backend())
-            decryptor = cipher.decryptor()
-            decrypted_padded = decryptor.update(encrypted_bytes) + decryptor.finalize()
-            
-            # Unpad the data
-            unpadder = sym_padding.PKCS7(algorithms.AES.block_size).unpadder()
-            private_key_pem = unpadder.update(decrypted_padded) + unpadder.finalize()
-            
-            self.private_key = serialization.load_pem_private_key(
-                private_key_pem,
-                password=None,
-                backend=default_backend()
-            )
-            return True
-        except:
-            return False
-    
-    def set_security_questions(self, question, answer):
-        """Set one security question and answer (hashed)"""
-        if question and answer:
-            # Add salt to answer before hashing
-            salt = os.urandom(16)
-            salted_answer = salt + answer.encode()
-            hashed_answer = hashlib.sha256(salted_answer).hexdigest()
-            self.security_questions = {
-                'question': question,
-                'hash': hashed_answer,
-                'salt': base64.b64encode(salt).decode('utf-8')
-            }
-    
-    def verify_security_answer(self, answer):
-        """Verify security question answer"""
-        if not self.security_questions:
-            return False
+            # Verify signature
+            signature_valid = verify_signature(decrypted if recipient_id == current_user_id else encrypted_msg, 
+                                               signature, sender_public_key)
+        except Exception as e:
+            decrypted = f"[Decryption failed: {str(e)}]"
+            signature_valid = False
         
-        stored_data = self.security_questions
-        salt = base64.b64decode(stored_data['salt'])
-        salted_answer = salt + answer.encode()
-        hashed_answer = hashlib.sha256(salted_answer).hexdigest()
-        
-        return stored_data['hash'] == hashed_answer
-    
-    def sign_document(self, document):
-        """Sign a document with private key"""
-        signature = self.private_key.sign(
-            document.encode('utf-8'),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        return base64.b64encode(signature).decode('utf-8')
-    
-    def encrypt_message(self, message, recipient_public_key):
-        """Encrypt message for recipient"""
-        # For simplicity, we'll encrypt with hybrid encryption
-        # Generate a random symmetric key
-        symmetric_key = os.urandom(32)
-        
-        # Encrypt message with symmetric key
-        cipher = Cipher(algorithms.AES(symmetric_key), modes.CBC(os.urandom(16)), backend=default_backend())
-        encryptor = cipher.encryptor()
-        padder = sym_padding.PKCS7(algorithms.AES.block_size).padder()
-        padded_data = padder.update(message.encode()) + padder.finalize()
-        encrypted_message = encryptor.update(padded_data) + encryptor.finalize()
-        
-        # Encrypt symmetric key with recipient's public key
-        encrypted_key = recipient_public_key.encrypt(
-            symmetric_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-        
-        return {
-            'encrypted_message': base64.b64encode(encrypted_message).decode('utf-8'),
-            'encrypted_key': base64.b64encode(encrypted_key).decode('utf-8')
-        }
-
-class SecureChatSystem:
-    def __init__(self):
-        self.ca = CertificateAuthority()
-        self.users = {}
-        self.online_users = set()
-        self.message_queue = queue.Queue()
-        self.db = Database()
-        self.json_storage = JSONStorage()
-    
-    def register_user(self, username, password, security_question, security_answer):
-        """Register a new user"""
-        if username in self.users:
-            return False, "Username already exists"
-        
-        if len(password) < 8:
-            return False, "Password must be at least 8 characters"
-        
-        user = SecureUser(username)
-        public_key = user.generate_key_pair(password)
-        user.set_security_questions(security_question, security_answer)
-        
-        # Issue certificate
-        certificate = self.ca.issue_certificate(username, public_key)
-        user.certificate = certificate
-        
-        # Save to memory
-        self.users[username] = user
-        
-        # Save to database
-        public_key_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode('utf-8')
-        
-        self.db.save_user(
-            username,
-            user.encrypted_private_key,
-            user.salt,
-            user.iv,
-            public_key_pem,
-            certificate,
-            user.security_questions
-        )
-        
-        # Save to JSON
-        self.json_storage.save_user(username, {
-            'encrypted_private_key': user.encrypted_private_key,
-            'salt': user.salt,
-            'iv': user.iv,
-            'public_key': public_key_pem,
-            'certificate': certificate,
-            'security_questions': user.security_questions
+        result.append({
+            'message_id': msg_id,
+            'is_sent': is_sent,
+            'decrypted_message': decrypted,
+            'timestamp': timestamp,
+            'signature_valid': signature_valid
         })
-        
-        return True, "Registration successful. Digital certificate issued."
     
-    def authenticate_user(self, username, password):
-        """Authenticate user with password and certificate"""
-        # Try to load from memory first
-        if username not in self.users:
-            # Load from database
-            user_data = self.db.get_user(username)
-            if not user_data:
-                return False, "User not found"
-            
-            # Create user object
-            user = SecureUser(username)
-            user.encrypted_private_key = user_data['encrypted_private_key']
-            user.salt = user_data['salt']
-            user.iv = user_data['iv']
-            user.certificate = user_data['certificate']
-            user.security_questions = user_data['security_questions']
-            
-            # Load public key
-            user.public_key = serialization.load_pem_public_key(
-                user_data['public_key'].encode(),
-                backend=default_backend()
-            )
-            
-            self.users[username] = user
-        
-        user = self.users[username]
-        
-        # Load private key with password
-        if not user.load_private_key(password):
-            return False, "Invalid password"
-        
-        # Verify certificate
-        if not self.ca.verify_certificate(user.certificate):
-            return False, "Invalid or revoked certificate"
-        
-        return True, "Authentication successful. Certificate verified."
-    
-    def forgot_password(self, username, security_answer):
-        """Reset password using security question"""
-        if username not in self.users:
-            # Load from database
-            user_data = self.db.get_user(username)
-            if not user_data:
-                return False, "User not found"
-            
-            user = SecureUser(username)
-            user.security_questions = user_data['security_questions']
-        else:
-            user = self.users[username]
-        
-        if not user.verify_security_answer(security_answer):
-            return False, "Incorrect security answer"
-        
-        return True, "Security answer verified. You can now reset your password."
-    
-    def reset_password(self, username, new_password):
-        """Reset user password"""
-        if username not in self.users:
-            return False, "User not found"
-        
-        user = self.users[username]
-        
-        # Generate new encrypted private key with new password
-        private_key_pem = user.private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        
-        user.encrypted_private_key, user.salt, user.iv = user._encrypt_with_password(
-            private_key_pem, new_password
-        )
-        
-        # Update in database
-        public_key_pem = user.public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode('utf-8')
-        
-        self.db.save_user(
-            username,
-            user.encrypted_private_key,
-            user.salt,
-            user.iv,
-            public_key_pem,
-            user.certificate,
-            user.security_questions
-        )
-        
-        return True, "Password reset successful"
-    
-    def send_message(self, sender, receiver, message, encrypt=True, sign=True):
-        """Send message from sender to receiver"""
-        if receiver not in self.users:
-            return False, "Receiver not found"
-        
-        # Sign the message if requested
-        signature = None
-        if sign:
-            signature = self.users[sender].sign_document(message)
-        
-        # Encrypt the message if requested
-        encrypted_message = message
-        if encrypt:
-            # Get receiver's public key
-            receiver_public_key = self.users[receiver].public_key
-            encrypted_data = self.users[sender].encrypt_message(message, receiver_public_key)
-            encrypted_message = json.dumps(encrypted_data)
-        
-        # Save to database
-        self.db.save_message(sender, receiver, encrypted_message, encrypt, sign, signature)
-        
-        # Add to message queue for real-time delivery
-        self.message_queue.put({
-            'sender': sender,
-            'receiver': receiver,
-            'message': encrypted_message,
-            'encrypted': encrypt,
-            'signed': sign,
-            'signature': signature,
-            'timestamp': datetime.now()
-        })
-        
-        return True, "Message sent successfully"
+    return jsonify({'messages': result})
 
-# ====================== GUI APPLICATION ======================
-class SecureChatApp:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("SecureChat Pro - PKI Secure Messaging")
-        self.root.geometry("1200x800")
-        self.root.configure(bg=Styles.BG)
-        
-        # System
-        self.chat_system = SecureChatSystem()
-        self.current_user = None
-        
-        # Create a container for all pages
-        self.container = tk.Frame(self.root, bg=Styles.BG)
-        self.container.pack(fill="both", expand=True)
-        
-        # Initialize all frames
-        self.frames = {}
-        self.create_welcome_page()
-        self.create_admin_login_page()
-        self.create_admin_panel()
-        self.create_registration_page()
-        self.create_login_page()
-        self.create_forgot_password_page()
-        self.create_dashboard_page()
-        
-        # Show welcome page first
-        self.show_frame("WelcomePage")
-        
-        # Center window
-        self.center_window()
+@app.route('/send_message', methods=['POST'])
+@login_required
+def send_message():
+    """Send encrypted message with digital signature"""
+    data = request.json
+    recipient_id = data['recipient_id']
+    message = data['message']
     
-    def create_welcome_page(self):
-        """Create the welcome/intro page"""
-        frame = tk.Frame(self.container, bg=Styles.BG)
-        self.frames["WelcomePage"] = frame
-        
-        # Main content
-        content_frame = tk.Frame(frame, bg=Styles.BG)
-        content_frame.place(relx=0.5, rely=0.5, anchor="center")
-        
-        # Logo/Title
-        title_label = tk.Label(
-            content_frame,
-            text="🔒 SecureChat Pro",
-            font=Styles.TITLE_FONT,
-            bg=Styles.BG,
-            fg=Styles.LIGHT
-        )
-        title_label.pack(pady=(0, 10))
-        
-        subtitle_label = tk.Label(
-            content_frame,
-            text="PKI-Based Secure Messaging System",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.BG,
-            fg=Styles.SECONDARY
-        )
-        subtitle_label.pack(pady=(0, 30))
-        
-        # Features
-        features = [
-            "✓ Military-Grade Encryption",
-            "✓ Digital Certificates",
-            "✓ End-to-End Encryption",
-            "✓ Secure Document Signing",
-            "✓ Password Recovery",
-            "✓ Audit Trail"
-        ]
-        
-        for feature in features:
-            feature_label = tk.Label(
-                content_frame,
-                text=feature,
-                font=Styles.BODY_FONT,
-                bg=Styles.BG,
-                fg=Styles.LIGHT
-            )
-            feature_label.pack(pady=5)
-        
-        # Buttons
-        button_frame = tk.Frame(content_frame, bg=Styles.BG)
-        button_frame.pack(pady=30)
-        
-        admin_btn = Styles.create_rounded_button(
-            button_frame,
-            "👨‍💼 Admin Login",
-            lambda: self.show_frame("AdminLoginPage"),
-            "warning",
-            20
-        )
-        admin_btn.pack(side="left", padx=10)
-        
-        register_btn = Styles.create_rounded_button(
-            button_frame,
-            "📝 Create Account",
-            lambda: self.show_frame("RegistrationPage"),
-            "primary",
-            20
-        )
-        register_btn.pack(side="left", padx=10)
-        
-        login_btn = Styles.create_rounded_button(
-            button_frame,
-            "🔐 Login",
-            lambda: self.show_frame("LoginPage"),
-            "success",
-            20
-        )
-        login_btn.pack(side="left", padx=10)
-    
-    def create_admin_login_page(self):
-        """Create admin login page"""
-        frame = tk.Frame(self.container, bg=Styles.BG)
-        self.frames["AdminLoginPage"] = frame
-        
-        # Header
-        header_frame = tk.Frame(frame, bg=Styles.PRIMARY, height=80)
-        header_frame.pack(fill="x")
-        header_frame.pack_propagate(False)
-        
-        tk.Label(
-            header_frame,
-            text="Admin Login",
-            font=Styles.HEADING_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT
-        ).pack(pady=20)
-        
-        # Back button
-        back_btn = tk.Button(
-            header_frame,
-            text="← Back",
-            command=lambda: self.show_frame("WelcomePage"),
-            font=Styles.BODY_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT,
-            bd=0,
-            cursor="hand2"
-        )
-        back_btn.place(x=20, y=25)
-        
-        # Main form
-        main_frame = tk.Frame(frame, bg=Styles.BG)
-        main_frame.pack(fill="both", expand=True)
-        
-        # Center container
-        center_frame = tk.Frame(main_frame, bg=Styles.BG)
-        center_frame.place(relx=0.5, rely=0.5, anchor="center")
-        
-        # Login card
-        login_card = tk.Frame(center_frame, bg=Styles.CARD_BG, padx=40, pady=40)
-        login_card.pack()
-        
-        # Title
-        tk.Label(
-            login_card,
-            text="👨‍💼 Admin Panel",
-            font=Styles.HEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(pady=(0, 30))
-        
-        # Email
-        tk.Label(
-            login_card,
-            text="Admin Email:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.admin_email = tk.Entry(
-            login_card,
-            font=Styles.BODY_FONT,
-            width=30,
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.admin_email.insert(0, "admin@gmail.com")
-        self.admin_email.pack(pady=(0, 15), fill="x")
-        
-        # Password
-        tk.Label(
-            login_card,
-            text="Password:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.admin_password = tk.Entry(
-            login_card,
-            font=Styles.BODY_FONT,
-            width=30,
-            show="•",
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.admin_password.insert(0, "admin123@")
-        self.admin_password.pack(pady=(0, 30), fill="x")
-        
-        # Login button
-        login_btn = Styles.create_rounded_button(
-            login_card,
-            "🔑 Login as Admin",
-            self.admin_login,
-            "warning",
-            20
-        )
-        login_btn.pack(pady=(0, 20))
-    
-    def create_admin_panel(self):
-        """Create admin panel page"""
-        frame = tk.Frame(self.container, bg=Styles.BG)
-        self.frames["AdminPanel"] = frame
-        
-        # Header
-        header_frame = tk.Frame(frame, bg=Styles.WARNING, height=80)
-        header_frame.pack(fill="x")
-        header_frame.pack_propagate(False)
-        
-        tk.Label(
-            header_frame,
-            text="🔧 Admin Control Panel",
-            font=Styles.HEADING_FONT,
-            bg=Styles.WARNING,
-            fg="white"
-        ).pack(pady=20)
-        
-        # Back button
-        back_btn = tk.Button(
-            header_frame,
-            text="← Back",
-            command=lambda: self.show_frame("WelcomePage"),
-            font=Styles.BODY_FONT,
-            bg=Styles.WARNING,
-            fg="white",
-            bd=0,
-            cursor="hand2"
-        )
-        back_btn.place(x=20, y=25)
-        
-        # Main content
-        main_frame = tk.Frame(frame, bg=Styles.BG)
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        # Left panel - User Management
-        left_panel = tk.Frame(main_frame, bg=Styles.CARD_BG, width=300)
-        left_panel.pack(side="left", fill="y", padx=(0, 20))
-        left_panel.pack_propagate(False)
-        
-        tk.Label(
-            left_panel,
-            text="👥 User Management",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(pady=20)
-        
-        # Users list
-        self.admin_users_list = tk.Listbox(
-            left_panel,
-            font=Styles.BODY_FONT,
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            selectbackground=Styles.WARNING,
-            selectforeground=Styles.LIGHT,
-            relief="flat",
-            height=15
-        )
-        self.admin_users_list.pack(fill="both", expand=True, padx=10, pady=(0, 20))
-        
-        # Right panel - Statistics and Actions
-        right_panel = tk.Frame(main_frame, bg=Styles.BG)
-        right_panel.pack(side="right", fill="both", expand=True)
-        
-        # Stats frame
-        stats_frame = tk.Frame(right_panel, bg=Styles.CARD_BG, padx=20, pady=20)
-        stats_frame.pack(fill="x", pady=(0, 20))
-        
-        tk.Label(
-            stats_frame,
-            text="📊 System Statistics",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 15))
-        
-        self.stats_label = tk.Label(
-            stats_frame,
-            text="Total Users: 0\nTotal Messages: 0\nOnline Users: 0",
-            font=Styles.BODY_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT,
-            justify="left"
-        )
-        self.stats_label.pack(anchor="w")
-        
-        # Actions frame
-        actions_frame = tk.Frame(right_panel, bg=Styles.CARD_BG, padx=20, pady=20)
-        actions_frame.pack(fill="both", expand=True)
-        
-        tk.Label(
-            actions_frame,
-            text="⚡ Quick Actions",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 15))
-        
-        # Action buttons
-        refresh_btn = Styles.create_rounded_button(
-            actions_frame,
-            "🔄 Refresh Data",
-            self.refresh_admin_data,
-            "primary",
-            25
-        )
-        refresh_btn.pack(fill="x", pady=5)
-        
-        view_cert_btn = Styles.create_rounded_button(
-            actions_frame,
-            "📜 View Certificate",
-            self.view_user_certificate,
-            "info",
-            25
-        )
-        view_cert_btn.pack(fill="x", pady=5)
-        
-        revoke_cert_btn = Styles.create_rounded_button(
-            actions_frame,
-            "🚫 Revoke Certificate",
-            self.revoke_certificate,
-            "danger",
-            25
-        )
-        revoke_cert_btn.pack(fill="x", pady=5)
-        
-        export_btn = Styles.create_rounded_button(
-            actions_frame,
-            "💾 Export User Data",
-            self.export_user_data,
-            "success",
-            25
-        )
-        export_btn.pack(fill="x", pady=5)
-    
-    def create_registration_page(self):
-        """Create the registration page"""
-        frame = tk.Frame(self.container, bg=Styles.BG)
-        self.frames["RegistrationPage"] = frame
-        
-        # Header
-        header_frame = tk.Frame(frame, bg=Styles.PRIMARY, height=80)
-        header_frame.pack(fill="x")
-        header_frame.pack_propagate(False)
-        
-        tk.Label(
-            header_frame,
-            text="Create New Account",
-            font=Styles.HEADING_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT
-        ).pack(pady=20)
-        
-        # Back button
-        back_btn = tk.Button(
-            header_frame,
-            text="← Back",
-            command=lambda: self.show_frame("WelcomePage"),
-            font=Styles.BODY_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT,
-            bd=0,
-            cursor="hand2"
-        )
-        back_btn.place(x=20, y=25)
-        
-        # Main form
-        main_frame = tk.Frame(frame, bg=Styles.BG)
-        main_frame.pack(fill="both", expand=True, padx=50, pady=30)
-        
-        # Form container
-        form_container = tk.Frame(main_frame, bg=Styles.CARD_BG, padx=30, pady=30)
-        form_container.pack(fill="both", expand=True)
-        
-        # Username
-        tk.Label(
-            form_container,
-            text="Username:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.reg_username = tk.Entry(
-            form_container,
-            font=Styles.BODY_FONT,
-            width=40,
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.reg_username.pack(pady=(0, 15), fill="x")
-        
-        # Password
-        tk.Label(
-            form_container,
-            text="Password (min 8 characters):",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.reg_password = tk.Entry(
-            form_container,
-            font=Styles.BODY_FONT,
-            width=40,
-            show="•",
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.reg_password.pack(pady=(0, 15), fill="x")
-        
-        # Confirm Password
-        tk.Label(
-            form_container,
-            text="Confirm Password:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.reg_confirm_password = tk.Entry(
-            form_container,
-            font=Styles.BODY_FONT,
-            width=40,
-            show="•",
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.reg_confirm_password.pack(pady=(0, 25), fill="x")
-        
-        # Security Question
-        tk.Label(
-            form_container,
-            text="Select Security Question:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 10))
-        
-        self.security_questions = [
-            "What is your mother's maiden name?",
-            "What was the name of your first pet?",
-            "What city were you born in?",
-            "What is the name of your elementary school?",
-            "What was your childhood nickname?"
-        ]
-        
-        self.security_question_var = tk.StringVar(value=self.security_questions[0])
-        security_combo = ttk.Combobox(
-            form_container,
-            textvariable=self.security_question_var,
-            values=self.security_questions,
-            font=Styles.BODY_FONT,
-            state="readonly"
-        )
-        security_combo.pack(pady=(0, 10), fill="x")
-        
-        # Security Answer
-        tk.Label(
-            form_container,
-            text="Your Answer:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.security_answer = tk.Entry(
-            form_container,
-            font=Styles.BODY_FONT,
-            width=40,
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.security_answer.pack(pady=(0, 25), fill="x")
-        
-        # Register button
-        register_btn = Styles.create_rounded_button(
-            form_container,
-            "🎯 Register & Generate Certificate",
-            self.register_user,
-            "success",
-            30
-        )
-        register_btn.pack(pady=20)
-    
-    def create_login_page(self):
-        """Create the login page"""
-        frame = tk.Frame(self.container, bg=Styles.BG)
-        self.frames["LoginPage"] = frame
-        
-        # Header
-        header_frame = tk.Frame(frame, bg=Styles.PRIMARY, height=80)
-        header_frame.pack(fill="x")
-        header_frame.pack_propagate(False)
-        
-        tk.Label(
-            header_frame,
-            text="Secure Login",
-            font=Styles.HEADING_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT
-        ).pack(pady=20)
-        
-        # Back button
-        back_btn = tk.Button(
-            header_frame,
-            text="← Back",
-            command=lambda: self.show_frame("WelcomePage"),
-            font=Styles.BODY_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT,
-            bd=0,
-            cursor="hand2"
-        )
-        back_btn.place(x=20, y=25)
-        
-        # Main form
-        main_frame = tk.Frame(frame, bg=Styles.BG)
-        main_frame.pack(fill="both", expand=True)
-        
-        # Center container
-        center_frame = tk.Frame(main_frame, bg=Styles.BG)
-        center_frame.place(relx=0.5, rely=0.5, anchor="center")
-        
-        # Login card
-        login_card = tk.Frame(center_frame, bg=Styles.CARD_BG, padx=40, pady=40)
-        login_card.pack()
-        
-        # Title
-        tk.Label(
-            login_card,
-            text="🔐 PKI Authentication",
-            font=Styles.HEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(pady=(0, 30))
-        
-        # Username
-        tk.Label(
-            login_card,
-            text="Username:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.login_username = tk.Entry(
-            login_card,
-            font=Styles.BODY_FONT,
-            width=30,
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.login_username.pack(pady=(0, 15), fill="x")
-        
-        # Password
-        tk.Label(
-            login_card,
-            text="Password:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.login_password = tk.Entry(
-            login_card,
-            font=Styles.BODY_FONT,
-            width=30,
-            show="•",
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.login_password.pack(pady=(0, 30), fill="x")
-        
-        # Login button
-        login_btn = Styles.create_rounded_button(
-            login_card,
-            "🚀 Login with PKI",
-            self.login_user,
-            "primary",
-            20
-        )
-        login_btn.pack(pady=(0, 10))
-        
-        # Forgot password button
-        forgot_btn = Styles.create_rounded_button(
-            login_card,
-            "🔓 Forgot Password?",
-            lambda: self.show_frame("ForgotPasswordPage"),
-            "warning",
-            20
-        )
-        forgot_btn.pack(pady=(0, 20))
-        
-        # Register link
-        register_link = tk.Label(
-            login_card,
-            text="Don't have an account? Register here",
-            font=Styles.BODY_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.SECONDARY,
-            cursor="hand2"
-        )
-        register_link.pack()
-        register_link.bind("<Button-1>", lambda e: self.show_frame("RegistrationPage"))
-    
-    def create_forgot_password_page(self):
-        """Create forgot password page"""
-        frame = tk.Frame(self.container, bg=Styles.BG)
-        self.frames["ForgotPasswordPage"] = frame
-        
-        # Header
-        header_frame = tk.Frame(frame, bg=Styles.PRIMARY, height=80)
-        header_frame.pack(fill="x")
-        header_frame.pack_propagate(False)
-        
-        tk.Label(
-            header_frame,
-            text="Password Recovery",
-            font=Styles.HEADING_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT
-        ).pack(pady=20)
-        
-        # Back button
-        back_btn = tk.Button(
-            header_frame,
-            text="← Back",
-            command=lambda: self.show_frame("LoginPage"),
-            font=Styles.BODY_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT,
-            bd=0,
-            cursor="hand2"
-        )
-        back_btn.place(x=20, y=25)
-        
-        # Main form
-        main_frame = tk.Frame(frame, bg=Styles.BG)
-        main_frame.pack(fill="both", expand=True, padx=50, pady=30)
-        
-        # Form container
-        form_container = tk.Frame(main_frame, bg=Styles.CARD_BG, padx=30, pady=30)
-        form_container.pack(fill="both", expand=True)
-        
-        # Username
-        tk.Label(
-            form_container,
-            text="Enter Username:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.forgot_username = tk.Entry(
-            form_container,
-            font=Styles.BODY_FONT,
-            width=40,
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.forgot_username.pack(pady=(0, 15), fill="x")
-        
-        # Security Question
-        self.forgot_question_var = tk.StringVar()
-        self.forgot_question_label = tk.Label(
-            form_container,
-            text="Security Question:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        )
-        self.forgot_question_label.pack(anchor="w", pady=(15, 5))
-        
-        self.forgot_question_display = tk.Label(
-            form_container,
-            text="",
-            font=Styles.BODY_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.WARNING,
-            wraplength=500
-        )
-        self.forgot_question_display.pack(anchor="w", pady=(0, 10), fill="x")
-        
-        # Security Answer
-        tk.Label(
-            form_container,
-            text="Your Answer:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(10, 5))
-        
-        self.forgot_answer = tk.Entry(
-            form_container,
-            font=Styles.BODY_FONT,
-            width=40,
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.forgot_answer.pack(pady=(0, 15), fill="x")
-        
-        # New Password
-        tk.Label(
-            form_container,
-            text="New Password (min 8 characters):",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(15, 5))
-        
-        self.new_password = tk.Entry(
-            form_container,
-            font=Styles.BODY_FONT,
-            width=40,
-            show="•",
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.new_password.pack(pady=(0, 15), fill="x")
-        
-        # Confirm New Password
-        tk.Label(
-            form_container,
-            text="Confirm New Password:",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(anchor="w", pady=(0, 5))
-        
-        self.confirm_new_password = tk.Entry(
-            form_container,
-            font=Styles.BODY_FONT,
-            width=40,
-            show="•",
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.confirm_new_password.pack(pady=(0, 25), fill="x")
-        
-        # Buttons
-        button_frame = tk.Frame(form_container, bg=Styles.CARD_BG)
-        button_frame.pack(pady=10)
-        
-        check_btn = Styles.create_rounded_button(
-            button_frame,
-            "🔍 Check Security Question",
-            self.check_security_question,
-            "info",
-            25
-        )
-        check_btn.pack(side="left", padx=5)
-        
-        reset_btn = Styles.create_rounded_button(
-            button_frame,
-            "🔄 Reset Password",
-            self.reset_password,
-            "success",
-            25
-        )
-        reset_btn.pack(side="left", padx=5)
-    
-    def create_dashboard_page(self):
-        """Create the main dashboard/chat page"""
-        frame = tk.Frame(self.container, bg=Styles.BG)
-        self.frames["DashboardPage"] = frame
-        
-        # Header
-        header_frame = tk.Frame(frame, bg=Styles.PRIMARY, height=60)
-        header_frame.pack(fill="x")
-        header_frame.pack_propagate(False)
-        
-        # Left: App name and user info
-        left_header = tk.Frame(header_frame, bg=Styles.PRIMARY)
-        left_header.pack(side="left", padx=20)
-        
-        tk.Label(
-            left_header,
-            text="SecureChat Pro",
-            font=("Segoe UI", 14, "bold"),
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT
-        ).pack(side="left", padx=(0, 20))
-        
-        self.user_label = tk.Label(
-            left_header,
-            text="Not logged in",
-            font=Styles.BODY_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.WARNING
-        )
-        self.user_label.pack(side="left")
-        
-        # Right: Logout button
-        logout_btn = tk.Button(
-            header_frame,
-            text="Logout",
-            command=self.logout,
-            font=Styles.BODY_FONT,
-            bg=Styles.DANGER,
-            fg=Styles.LIGHT,
-            relief="flat",
-            padx=15,
-            pady=5,
-            cursor="hand2"
-        )
-        logout_btn.pack(side="right", padx=20, pady=10)
-        
-        # Main content area
-        main_content = tk.Frame(frame, bg=Styles.BG)
-        main_content.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        # Left sidebar (25%)
-        sidebar = tk.Frame(main_content, bg=Styles.CARD_BG, width=250)
-        sidebar.pack(side="left", fill="y", padx=(0, 20))
-        sidebar.pack_propagate(False)
-        
-        # Sidebar content
-        tk.Label(
-            sidebar,
-            text="👥 All Users",
-            font=Styles.SUBHEADING_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT
-        ).pack(pady=20)
-        
-        # Online users list
-        self.online_users_list = tk.Listbox(
-            sidebar,
-            font=Styles.BODY_FONT,
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            selectbackground=Styles.SECONDARY,
-            selectforeground=Styles.LIGHT,
-            relief="flat",
-            height=15
-        )
-        self.online_users_list.pack(fill="both", expand=True, padx=10, pady=(0, 20))
-        
-        # Chat controls
-        control_frame = tk.Frame(sidebar, bg=Styles.CARD_BG)
-        control_frame.pack(pady=10, padx=10, fill="x")
-        
-        self.encrypt_var = tk.BooleanVar(value=True)
-        encrypt_check = tk.Checkbutton(
-            control_frame,
-            text="🔒 Encrypt Messages",
-            variable=self.encrypt_var,
-            font=Styles.BODY_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT,
-            selectcolor=Styles.CARD_BG,
-            activebackground=Styles.CARD_BG,
-            activeforeground=Styles.LIGHT
-        )
-        encrypt_check.pack(anchor="w", pady=5)
-        
-        self.sign_var = tk.BooleanVar(value=True)
-        sign_check = tk.Checkbutton(
-            control_frame,
-            text="📝 Sign Messages",
-            variable=self.sign_var,
-            font=Styles.BODY_FONT,
-            bg=Styles.CARD_BG,
-            fg=Styles.LIGHT,
-            selectcolor=Styles.CARD_BG,
-            activebackground=Styles.CARD_BG,
-            activeforeground=Styles.LIGHT
-        )
-        sign_check.pack(anchor="w", pady=5)
-        
-        # Right content area (75%)
-        right_content = tk.Frame(main_content, bg=Styles.BG)
-        right_content.pack(side="right", fill="both", expand=True)
-        
-        # Chat display
-        chat_frame = tk.Frame(right_content, bg=Styles.BG)
-        chat_frame.pack(fill="both", expand=True, pady=(0, 20))
-        
-        self.chat_display = scrolledtext.ScrolledText(
-            chat_frame,
-            font=Styles.MONO_FONT,
-            bg="#2A3B4C",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            wrap="word",
-            relief="flat"
-        )
-        self.chat_display.pack(fill="both", expand=True)
-        self.chat_display.config(state="disabled")
-        
-        # Message input area
-        input_frame = tk.Frame(right_content, bg=Styles.BG)
-        input_frame.pack(fill="x")
-        
-        # Recipient
-        tk.Label(
-            input_frame,
-            text="To:",
-            font=Styles.BODY_FONT,
-            bg=Styles.BG,
-            fg=Styles.LIGHT
-        ).pack(side="left", padx=(0, 10))
-        
-        self.recipient_var = tk.StringVar()
-        self.recipient_combo = ttk.Combobox(
-            input_frame,
-            textvariable=self.recipient_var,
-            font=Styles.BODY_FONT,
-            width=20,
-            state="readonly"
-        )
-        self.recipient_combo.pack(side="left", padx=(0, 20))
-        
-        # Message input
-        self.message_entry = tk.Entry(
-            input_frame,
-            font=Styles.BODY_FONT,
-            bg="#3C4B5D",
-            fg=Styles.LIGHT,
-            insertbackground=Styles.LIGHT,
-            relief="flat"
-        )
-        self.message_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.message_entry.bind("<Return>", lambda e: self.send_message())
-        
-        # Send button
-        send_btn = Styles.create_rounded_button(
-            input_frame,
-            "🚀 Send",
-            self.send_message,
-            "success",
-            10
-        )
-        send_btn.pack(side="right")
-        
-        # Status bar at bottom
-        self.status_bar = tk.Label(
-            frame,
-            text="Ready",
-            font=Styles.BODY_FONT,
-            bg=Styles.PRIMARY,
-            fg=Styles.LIGHT,
-            anchor="w",
-            padx=20
-        )
-        self.status_bar.pack(side="bottom", fill="x")
-    
-    def show_frame(self, frame_name):
-        """Show a specific frame"""
-        frame = self.frames[frame_name]
-        frame.tkraise()
-        frame.pack(fill="both", expand=True)
-        
-        # Hide other frames
-        for name, f in self.frames.items():
-            if name != frame_name:
-                f.pack_forget()
-    
-    def center_window(self):
-        """Center the window on screen"""
-        self.root.update_idletasks()
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.root.winfo_screenheight() // 2) - (height // 2)
-        self.root.geometry(f'{width}x{height}+{x}+{y}')
-    
-    def admin_login(self):
-        """Handle admin login"""
-        email = self.admin_email.get().strip()
-        password = self.admin_password.get()
-        
-        if not email or not password:
-            messagebox.showerror("Error", "Please enter email and password")
-            return
-        
-        if self.chat_system.db.verify_admin(email, password):
-            self.show_frame("AdminPanel")
-            self.refresh_admin_data()
-            messagebox.showinfo("Success", "Admin login successful!")
-        else:
-            messagebox.showerror("Error", "Invalid admin credentials")
-    
-    def refresh_admin_data(self):
-        """Refresh admin panel data"""
-        # Get user list from JSON storage
-        users = list(self.chat_system.json_storage.data["users"].keys())
-        
-        self.admin_users_list.delete(0, tk.END)
-        for user in users:
-            self.admin_users_list.insert(tk.END, user)
-        
-        # Update stats
-        conn = sqlite3.connect(self.chat_system.db.db_file)
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("SELECT COUNT(*) FROM users")
-        total_users = cursor.fetchone()[0]
+        # Get recipient's public key
+        cursor.execute("SELECT public_key FROM users WHERE user_id = ?", (recipient_id,))
+        recipient_public_key = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(*) FROM messages")
-        total_messages = cursor.fetchone()[0]
+        # Get sender's private key from session
+        private_key_pem = session.get('private_key_pem')
+        if not private_key_pem:
+            return jsonify({'success': False, 'error': 'Session expired, please login again'})
         
+        private_key = serialization.load_pem_private_key(
+            private_key_pem.encode(),
+            password=None,
+            backend=default_backend()
+        )
+        
+        # Encrypt message with recipient's public key
+        encrypted_message = encrypt_message(message, recipient_public_key)
+        
+        # Sign the original message with sender's private key
+        signature = sign_message(message, private_key)
+        
+        # Store message
+        cursor.execute('''
+            INSERT INTO messages (sender_id, recipient_id, encrypted_message, digital_signature)
+            VALUES (?, ?, ?, ?)
+        ''', (session['user_id'], recipient_id, encrypted_message, signature))
+        
+        conn.commit()
         conn.close()
         
-        self.stats_label.config(
-            text=f"Total Users: {total_users}\n"
-                 f"Total Messages: {total_messages}\n"
-                 f"Online Users: {len(self.chat_system.online_users)}"
-        )
-    
-    def view_user_certificate(self):
-        """View selected user's certificate"""
-        selection = self.admin_users_list.curselection()
-        if not selection:
-            messagebox.showwarning("Warning", "Please select a user")
-            return
+        return jsonify({'success': True})
         
-        username = self.admin_users_list.get(selection[0])
-        user_data = self.chat_system.json_storage.get_user(username)
-        
-        if user_data:
-            cert = user_data['certificate']
-            cert_info = f"""
-User: {cert['user_id']}
-Serial Number: {cert['serial_number']}
-Issued: {cert['issue_date'][:19]}
-Expires: {cert['expiry_date'][:19]}
-Certificate Status: {'✓ Valid' if self.chat_system.ca.verify_certificate(cert) else '✗ Invalid'}
-"""
-            messagebox.showinfo("Certificate Details", cert_info)
-    
-    def revoke_certificate(self):
-        """Revoke selected user's certificate"""
-        selection = self.admin_users_list.curselection()
-        if not selection:
-            messagebox.showwarning("Warning", "Please select a user")
-            return
-        
-        username = self.admin_users_list.get(selection[0])
-        user_data = self.chat_system.json_storage.get_user(username)
-        
-        if user_data:
-            cert = user_data['certificate']
-            self.chat_system.ca.revoked_certificates.add(cert['serial_number'])
-            messagebox.showinfo("Success", f"Certificate for {username} has been revoked")
-    
-    def export_user_data(self):
-        """Export user data to file"""
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
-        )
-        
-        if file_path:
-            with open(file_path, 'w') as f:
-                json.dump(self.chat_system.json_storage.data, f, indent=4)
-            messagebox.showinfo("Success", f"Data exported to {file_path}")
-    
-    def register_user(self):
-        """Handle user registration"""
-        username = self.reg_username.get().strip()
-        password = self.reg_password.get()
-        confirm_password = self.reg_confirm_password.get()
-        security_question = self.security_question_var.get()
-        security_answer = self.security_answer.get().strip()
-        
-        # Validation
-        if not username or not password:
-            messagebox.showerror("Error", "Please fill in all fields")
-            return
-        
-        if len(password) < 8:
-            messagebox.showerror("Error", "Password must be at least 8 characters")
-            return
-        
-        if password != confirm_password:
-            messagebox.showerror("Error", "Passwords do not match")
-            return
-        
-        if not security_answer:
-            messagebox.showerror("Error", "Please answer the security question")
-            return
-        
-        # Register user
-        success, message = self.chat_system.register_user(
-            username, password, security_question, security_answer
-        )
-        
-        if success:
-            # Show success message with certificate details
-            user = self.chat_system.users[username]
-            cert_info = f"""
-✅ Registration Successful!
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 
-Username: {username}
-Certificate Serial: {user.certificate['serial_number'][:16]}...
-Issued: {user.certificate['issue_date'][:10]}
-Expires: {user.certificate['expiry_date'][:10]}
+@app.route('/logout')
+def logout():
+    """Logout user"""
+    session.clear()
+    flash('Logged out successfully', 'success')
+    return redirect(url_for('index'))
 
-Your digital certificate has been issued and your private key is securely stored.
-You can now login with your credentials.
-"""
-            messagebox.showinfo("Registration Complete", cert_info)
-            
-            # Clear form and go to login page
-            self.reg_username.delete(0, tk.END)
-            self.reg_password.delete(0, tk.END)
-            self.reg_confirm_password.delete(0, tk.END)
-            self.security_answer.delete(0, tk.END)
-            
-            self.show_frame("LoginPage")
-        else:
-            messagebox.showerror("Registration Failed", message)
-    
-    def login_user(self):
-        """Handle user login"""
-        username = self.login_username.get().strip()
-        password = self.login_password.get()
+# Admin routes
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    """Admin login"""
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
         
-        if not username or not password:
-            messagebox.showerror("Error", "Please enter username and password")
-            return
-        
-        success, message = self.chat_system.authenticate_user(username, password)
-        
-        if success:
-            self.current_user = username
-            self.chat_system.online_users.add(username)
-            
-            # Load ALL registered users from database into chat system
-            all_users = self.chat_system.db.get_all_users()
-            
-            # Ensure all users are loaded in the system (not just authenticated ones)
-            for user in all_users:
-                if user not in self.chat_system.users:
-                    # Load user data from database
-                    user_data = self.chat_system.db.get_user(user)
-                    if user_data:
-                        secure_user = SecureUser(user)
-                        secure_user.encrypted_private_key = user_data['encrypted_private_key']
-                        secure_user.salt = user_data['salt']
-                        secure_user.iv = user_data['iv']
-                        secure_user.certificate = user_data['certificate']
-                        secure_user.security_questions = user_data['security_questions']
-                        
-                        # Load public key
-                        secure_user.public_key = serialization.load_pem_public_key(
-                            user_data['public_key'].encode(),
-                            backend=default_backend()
-                        )
-                        
-                        self.chat_system.users[user] = secure_user
-            
-            # Update UI
-            self.user_label.config(
-                text=f"👤 {username} | ✅ Certificate Verified",
-                fg=Styles.SUCCESS
-            )
-            self.update_online_users()
-            self.update_status(f"Welcome {username}!")
-            
-            # Load previous messages
-            self.load_previous_messages()
-            
-            # Show dashboard
-            self.show_frame("DashboardPage")
-            
-            # Start periodic updates
-            self.schedule_online_users_update()
-            
-            # Add welcome message to chat
-            self.add_chat_message("System", f"User '{username}' logged in with valid PKI certificate")
-            
-            messagebox.showinfo("Login Successful", "PKI authentication successful!\nYour digital certificate has been verified.")
-        else:
-            messagebox.showerror("Login Failed", message)
-    
-    def update_online_users(self):
-        """Update online users list"""
-        if not self.current_user:
-            return
-        
-        # Get ALL users from database (not just online ones)
-        all_users = self.chat_system.db.get_all_users()
-        
-        # Update listbox
-        self.online_users_list.delete(0, tk.END)
-        
-        # Add online users first
-        online_users = sorted(self.chat_system.online_users)
-        for user in online_users:
-            if user != self.current_user:
-                self.online_users_list.insert(tk.END, f"🟢 {user}")
-        
-        # Add offline users
-        offline_users = [user for user in all_users if user not in self.chat_system.online_users]
-        for user in offline_users:
-            if user != self.current_user:
-                self.online_users_list.insert(tk.END, f"⚫ {user}")
-        
-        # Update combobox with ALL users (for messaging)
-        all_users_for_combo = sorted([user for user in all_users if user != self.current_user])
-        self.recipient_combo['values'] = all_users_for_combo
-        
-        # If there are users, select the first one by default
-        if all_users_for_combo:
-            self.recipient_var.set(all_users_for_combo[0])
-    
-    def schedule_online_users_update(self):
-        """Schedule periodic update of online users list"""
-        if self.current_user and "DashboardPage" in self.frames:
-            self.update_online_users()
-            # Update every 5 seconds
-            self.root.after(5000, self.schedule_online_users_update)
-    
-    def check_security_question(self):
-        """Check user's security question"""
-        username = self.forgot_username.get().strip()
-        
-        if not username:
-            messagebox.showerror("Error", "Please enter username")
-            return
-        
-        # Get user from database
-        user_data = self.chat_system.db.get_user(username)
-        if not user_data:
-            messagebox.showerror("Error", "User not found")
-            return
-        
-        # Display security question
-        security_question = user_data['security_questions']['question']
-        self.forgot_question_display.config(text=security_question)
-        messagebox.showinfo("Security Question", f"Please answer your security question:\n\n{security_question}")
-    
-    def reset_password(self):
-        """Reset user password"""
-        username = self.forgot_username.get().strip()
-        answer = self.forgot_answer.get().strip()
-        new_password = self.new_password.get()
-        confirm_password = self.confirm_new_password.get()
-        
-        # Validation
-        if not username or not answer or not new_password or not confirm_password:
-            messagebox.showerror("Error", "Please fill in all fields")
-            return
-        
-        if len(new_password) < 8:
-            messagebox.showerror("Error", "Password must be at least 8 characters")
-            return
-        
-        if new_password != confirm_password:
-            messagebox.showerror("Error", "Passwords do not match")
-            return
-        
-        # Verify security answer
-        success, message = self.chat_system.forgot_password(username, answer)
-        if not success:
-            messagebox.showerror("Error", message)
-            return
-        
-        # Reset password
-        success, message = self.chat_system.reset_password(username, new_password)
-        if success:
-            messagebox.showinfo("Success", "Password reset successfully!\nYou can now login with your new password.")
-            self.show_frame("LoginPage")
-            
-            # Clear form
-            self.forgot_username.delete(0, tk.END)
-            self.forgot_answer.delete(0, tk.END)
-            self.new_password.delete(0, tk.END)
-            self.confirm_new_password.delete(0, tk.END)
-            self.forgot_question_display.config(text="")
-        else:
-            messagebox.showerror("Error", message)
-    
-    def logout(self):
-        """Handle user logout"""
-        if self.current_user:
-            self.chat_system.online_users.remove(self.current_user)
-            self.current_user = None
-        
-        self.show_frame("WelcomePage")
-    
-    def send_message(self):
-        """Send a chat message"""
-        if not self.current_user:
-            messagebox.showerror("Error", "Please login first")
-            return
-        
-        recipient = self.recipient_var.get()
-        message = self.message_entry.get().strip()
-        
-        if not recipient or not message:
-            messagebox.showerror("Error", "Please select recipient and enter message")
-            return
-        
-        if recipient == self.current_user:
-            messagebox.showerror("Error", "Cannot send message to yourself")
-            return
-        
-        # Send message through chat system
-        encrypt = self.encrypt_var.get()
-        sign = self.sign_var.get()
-        
-        success, result = self.chat_system.send_message(
-            self.current_user, recipient, message, encrypt, sign
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT admin_id, password_hash FROM admin_users WHERE username = ?",
+            (username,)
         )
+        admin = cursor.fetchone()
+        conn.close()
         
-        if success:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            icon = "🔒" if encrypt else "📝"
-            status = ""
-            if encrypt:
-                status += " [ENCRYPTED]"
-            if sign:
-                status += " [SIGNED]"
-            
-            self.add_chat_message(
-                self.current_user,
-                f"[{timestamp}] To {recipient}: {message}{status}"
-            )
-            
-            self.message_entry.delete(0, tk.END)
-            self.update_status(f"Message sent to {recipient}")
-        else:
-            messagebox.showerror("Error", result)
+        if not admin:
+            flash('Invalid credentials', 'error')
+            return render_template_string(LOGIN_TEMPLATE.replace('Login', 'Admin Login'))
+        
+        admin_id, stored_data = admin
+        stored_hash, salt = stored_data.split(':')
+        
+        if hash_password(password, salt) != stored_hash:
+            flash('Invalid credentials', 'error')
+            return render_template_string(LOGIN_TEMPLATE.replace('Login', 'Admin Login'))
+        
+        session['admin_id'] = admin_id
+        session['admin_username'] = username
+        return redirect(url_for('admin_panel'))
     
-    def load_previous_messages(self):
-        """Load previous messages for the current user"""
-        if not self.current_user:
-            return
-        
-        # Clear chat display
-        self.chat_display.config(state="normal")
-        self.chat_display.delete(1.0, tk.END)
-        
-        # Get all users
-        all_users = self.chat_system.db.get_all_users()
-        
-        for user in all_users:
-            if user != self.current_user:
-                messages = self.chat_system.db.get_messages(self.current_user, user)
-                if messages:
-                    self.add_chat_message("System", f"Previous conversation with {user}:")
-                    for msg in messages:
-                        sender = msg[1]
-                        message = msg[3]
-                        timestamp = msg[7][:19]
-                        
-                        if sender == self.current_user:
-                            prefix = f"[{timestamp}] You: "
-                        else:
-                            prefix = f"[{timestamp}] {sender}: "
-                        
-                        self.chat_display.insert("end", f"{prefix}{message}\n")
-        
-        self.chat_display.config(state="disabled")
-        self.chat_display.see("end")
-    
-    def add_chat_message(self, sender, message):
-        """Add message to chat display"""
-        self.chat_display.config(state="normal")
-        
-        # Color coding
-        if sender == "System":
-            tag = "system"
-            prefix = "🔔 SYSTEM: "
-            color = Styles.WARNING
-        elif sender == self.current_user:
-            tag = "you"
-            prefix = "👤 YOU: "
-            color = Styles.SECONDARY
-        else:
-            tag = "other"
-            prefix = f"👤 {sender}: "
-            color = Styles.SUCCESS
-        
-        # Insert message
-        self.chat_display.insert("end", f"{prefix}{message}\n", tag)
-        
-        # Apply color
-        self.chat_display.tag_config(tag, foreground=color)
-        
-        self.chat_display.config(state="disabled")
-        self.chat_display.see("end")
-    
-    def update_status(self, message):
-        """Update status bar"""
-        self.status_bar.config(text=f"📢 {message}")
-    
-    def run(self):
-        """Run the application"""
-        self.root.mainloop()
+    return render_template_string(LOGIN_TEMPLATE.replace('Login', 'Admin Login').replace('login', 'admin_login'))
 
-# ====================== MAIN EXECUTION ======================
-if __name__ == "__main__":
-    print("Starting SecureChat Pro...")
-    print("Admin Credentials: admin@gmail.com / admin123@")
-    app = SecureChatApp()
-    app.run()
+@app.route('/admin/panel')
+@admin_required
+def admin_panel():
+    """Admin dashboard"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Get statistics
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+    active_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM messages")
+    total_messages = cursor.fetchone()[0]
+    
+    stats = {
+        'total_users': total_users,
+        'active_users': active_users,
+        'total_messages': total_messages
+    }
+    
+    # Get all users
+    cursor.execute("SELECT user_id, username, created_at, is_active, certificate, public_key FROM users")
+    users = [dict(zip(['user_id', 'username', 'created_at', 'is_active', 'certificate', 'public_key'], row)) 
+             for row in cursor.fetchall()]
+    
+    # Get recent messages (metadata only)
+    cursor.execute('''
+        SELECT m.message_id, m.timestamp, m.is_read,
+               s.username as sender_username,
+               r.username as recipient_username
+        FROM messages m
+        JOIN users s ON m.sender_id = s.user_id
+        JOIN users r ON m.recipient_id = r.user_id
+        ORDER BY m.timestamp DESC
+        LIMIT 50
+    ''')
+    messages = [dict(zip(['message_id', 'timestamp', 'is_read', 'sender_username', 'recipient_username'], row))
+                for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    return render_template_string(ADMIN_TEMPLATE, stats=stats, users=users, messages=messages)
+
+@app.route('/admin/toggle_user', methods=['POST'])
+@admin_required
+def toggle_user():
+    """Enable/disable user account"""
+    data = request.json
+    user_id = data['user_id']
+    is_active = data['is_active']
+    
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET is_active = ? WHERE user_id = ?", (is_active, user_id))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True})
+
+@app.route('/admin/get_certificate')
+@admin_required
+def get_certificate():
+    """Return user certificate and public key as JSON for the admin modal"""
+    user_id = request.args.get('user_id', type=int)
+    
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT username, public_key, certificate FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return jsonify({'error': 'User not found'}), 404
+    
+    return jsonify({
+        'username': row[0],
+        'public_key': row[1],
+        'certificate': row[2]
+    })
+
+@app.route('/admin/logout')
+def admin_logout():
+    """Admin logout"""
+    session.clear()
+    return redirect(url_for('index'))
+
+# Main execution
+if __name__ == '__main__':
+    # Initialize database
+    init_database()
+    
+    # Save configuration to JSON
+    with open('config.json', 'w') as f:
+        json.dump(CONFIG, f, indent=2)
+    
+    print("=" * 60)
+    print("SecureChat System Starting...")
+    print("=" * 60)
+    print("Database:", DATABASE_PATH)
+    print("Keys Directory:", KEYS_DIR)
+    print("Default Admin: username=admin, password=admin123")
+    print("=" * 60)
+    print("Navigate to: http://localhost:5000")
+    print("=" * 60)
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
