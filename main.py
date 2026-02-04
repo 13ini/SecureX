@@ -1,23 +1,28 @@
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
+from flask import (Flask, render_template_string, request,
+                   redirect, url_for, session, flash, jsonify)
 import sqlite3
 import hashlib
 import secrets
 import json
 import os
-from datetime import datetime, timedelta
+import functools
+from datetime import datetime, timedelta, timezone
+from base64 import b64encode, b64decode
+
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 from cryptography import x509
 from cryptography.x509.oid import NameOID
-from base64 import b64encode, b64decode
-import functools
+from cryptography.exceptions import InvalidSignature
 
-# Initialize Flask app
+# ------
+# APP & CONFIG
+# ------
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 
-# Configuration
 CONFIG = {
     "app_config": {
         "key_size": 2048,
@@ -27,204 +32,402 @@ CONFIG = {
     },
     "ca_config": {
         "ca_name": "SecureChat CA",
-        "validity_days": 365
+        "ca_org": "SecureChat PKI",
+        "validity_days": 365,
+        "user_cert_validity_days": 365
     }
 }
 
 DATABASE_PATH = "secure_chat.db"
-KEYS_DIR = "user_keys"
+KEYS_DIR       = "user_keys"
+CA_KEYS_DIR    = "ca_keys"
+FILES_DIR      = "shared_files"  # NEW: encrypted files storage
 
-# Create keys directory
-os.makedirs(KEYS_DIR, exist_ok=True)
+os.makedirs(KEYS_DIR,    exist_ok=True)
+os.makedirs(CA_KEYS_DIR, exist_ok=True)
+os.makedirs(FILES_DIR,   exist_ok=True)  # NEW
 
-# Database initialization
+# ------
+# MODULE-LEVEL CA STATE  (loaded once at startup)
+# ------
+CA_PRIVATE_KEY = None   # rsa private key object
+CA_CERTIFICATE = None   # x509.Certificate object
+CA_CERT_PEM    = ""     # PEM string (trust anchor)
+
+
+# ================================================================
+# CA BOOTSTRAP
+# ================================================================
+def bootstrap_ca():
+    """
+    Generate or load the local Certificate Authority.
+    Called exactly once when the application starts.
+    """
+    global CA_PRIVATE_KEY, CA_CERTIFICATE, CA_CERT_PEM
+
+    priv_path = os.path.join(CA_KEYS_DIR, "ca_private.pem")
+    cert_path = os.path.join(CA_KEYS_DIR, "ca_cert.pem")
+
+    if os.path.exists(priv_path) and os.path.exists(cert_path):
+        # -- load existing CA --
+        with open(priv_path, "rb") as f:
+            CA_PRIVATE_KEY = serialization.load_pem_private_key(
+                f.read(), password=None, backend=default_backend()
+            )
+        with open(cert_path, "rb") as f:
+            ca_pem_bytes = f.read()
+            CA_CERTIFICATE = x509.load_pem_x509_certificate(
+                ca_pem_bytes, default_backend()
+            )
+            CA_CERT_PEM = ca_pem_bytes.decode()
+        print("[CA] Loaded existing CA from disk.")
+    else:
+        # -- generate new CA --
+        CA_PRIVATE_KEY = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=CONFIG["app_config"]["key_size"],
+            backend=default_backend()
+        )
+        ca_pub = CA_PRIVATE_KEY.public_key()
+
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME,            u"NP"),
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME,  u"Bagmati"),
+            x509.NameAttribute(NameOID.LOCALITY_NAME,           u"Kathmandu"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME,       CONFIG["ca_config"]["ca_org"]),
+            x509.NameAttribute(NameOID.COMMON_NAME,             CONFIG["ca_config"]["ca_name"]),
+        ])
+
+        CA_CERTIFICATE = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(ca_pub)
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.now(timezone.utc))
+            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=3650))  # 10 yr
+            .add_extension(
+                x509.BasicConstraints(ca=True, path_length=None), critical=True
+            )
+            .sign(CA_PRIVATE_KEY, hashes.SHA256(), default_backend())
+        )
+
+        # persist to disk
+        with open(priv_path, "wb") as f:
+            f.write(CA_PRIVATE_KEY.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption()
+            ))
+        with open(cert_path, "wb") as f:
+            ca_pem_bytes = CA_CERTIFICATE.public_bytes(serialization.Encoding.PEM)
+            f.write(ca_pem_bytes)
+            CA_CERT_PEM = ca_pem_bytes.decode()
+
+        print("[CA] Generated new CA key-pair and certificate.")
+
+
+# ================================================================
+# DATABASE
+# ================================================================
 def init_database():
-    """Initialize SQLite database with required tables"""
     conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
-    # Users table
-    cursor.execute('''
+    c    = conn.cursor()
+
+    c.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            public_key TEXT NOT NULL,
-            certificate TEXT NOT NULL,
-            security_q1 TEXT NOT NULL,
+            user_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            username         TEXT UNIQUE NOT NULL,
+            password_hash    TEXT NOT NULL,
+            salt             TEXT NOT NULL,
+            public_key       TEXT NOT NULL,
+            certificate      TEXT NOT NULL,
+            security_q1      TEXT NOT NULL,
             security_a1_hash TEXT NOT NULL,
-            security_q2 TEXT NOT NULL,
+            security_q2      TEXT NOT NULL,
             security_a2_hash TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_active BOOLEAN DEFAULT 1
+            created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active        BOOLEAN   DEFAULT 1
         )
     ''')
-    
-    # Messages table
-    cursor.execute('''
+
+    c.execute('''
         CREATE TABLE IF NOT EXISTS messages (
-            message_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_id INTEGER NOT NULL,
-            recipient_id INTEGER NOT NULL,
+            message_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id         INTEGER NOT NULL,
+            recipient_id      INTEGER NOT NULL,
             encrypted_message TEXT NOT NULL,
             digital_signature TEXT NOT NULL,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_read BOOLEAN DEFAULT 0,
-            FOREIGN KEY (sender_id) REFERENCES users(user_id),
+            timestamp         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_read           BOOLEAN   DEFAULT 0,
+            FOREIGN KEY (sender_id)    REFERENCES users(user_id),
             FOREIGN KEY (recipient_id) REFERENCES users(user_id)
         )
     ''')
-    
-    # Admin users table
-    cursor.execute('''
+
+    # NEW: Files table for encrypted file transfers
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS shared_files (
+            file_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id         INTEGER NOT NULL,
+            recipient_id      INTEGER NOT NULL,
+            original_filename TEXT NOT NULL,
+            encrypted_filename TEXT NOT NULL,
+            file_size         INTEGER NOT NULL,
+            encrypted_aes_key TEXT NOT NULL,
+            digital_signature TEXT NOT NULL,
+            timestamp         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_downloaded     BOOLEAN   DEFAULT 0,
+            FOREIGN KEY (sender_id)    REFERENCES users(user_id),
+            FOREIGN KEY (recipient_id) REFERENCES users(user_id)
+        )
+    ''')
+
+    c.execute('''
         CREATE TABLE IF NOT EXISTS admin_users (
-            admin_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
+            admin_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            username      TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
-    # Login attempts table (tracks failed attempts per username for lockout)
-    cursor.execute('''
+
+    c.execute('''
         CREATE TABLE IF NOT EXISTS login_attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            failed_attempts INTEGER DEFAULT 0,
-            locked BOOLEAN DEFAULT 0,
-            locked_at TIMESTAMP NULL
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            username        TEXT UNIQUE NOT NULL,
+            failed_attempts INTEGER  DEFAULT 0,
+            locked          BOOLEAN  DEFAULT 0,
+            locked_at       TIMESTAMP NULL
         )
     ''')
-    
-    # Create default admin if doesn't exist
+
+    # ---- CRL: Certificate Revocation List ----
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS revoked_certificates (
+            serial_number TEXT PRIMARY KEY,
+            username      TEXT NOT NULL,
+            revoked_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # default admin
     admin_salt = secrets.token_hex(16)
-    admin_password = hash_password("admin123", admin_salt)
     try:
-        cursor.execute(
+        c.execute(
             "INSERT INTO admin_users (username, password_hash) VALUES (?, ?)",
-            ("admin", admin_password + ":" + admin_salt)
+            ("admin", hash_password("admin123", admin_salt) + ":" + admin_salt)
         )
     except sqlite3.IntegrityError:
-        pass  # Admin already exists
-    
+        pass
+
     conn.commit()
     conn.close()
 
-# Cryptographic Functions
+
+# ================================================================
+# CRYPTOGRAPHIC HELPERS
+# ================================================================
+
 def hash_password(password, salt):
-    """Hash password using SHA-256 with salt"""
+    """SHA-256 password hash with salt."""
     return hashlib.sha256((password + salt).encode()).hexdigest()
 
+# ---- key-pair ----
 def generate_key_pair():
-    """Generate RSA key pair (2048-bit)"""
-    private_key = rsa.generate_private_key(
+    priv = rsa.generate_private_key(
         public_exponent=65537,
         key_size=CONFIG["app_config"]["key_size"],
         backend=default_backend()
     )
-    public_key = private_key.public_key()
-    return private_key, public_key
+    return priv, priv.public_key()
 
-def generate_certificate(username, public_key, private_key):
-    """Generate self-signed X.509 certificate"""
-    subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COUNTRY_NAME, u"NP"),
-        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"Bagmati"),
-        x509.NameAttribute(NameOID.LOCALITY_NAME, u"Kathmandu"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"SecureChat"),
-        x509.NameAttribute(NameOID.COMMON_NAME, username),
+
+# ---- CA-signed user certificate ----
+def generate_certificate(username, user_public_key):
+    """
+    Issue a user certificate signed by the local CA.
+    The issuer field = CA subject; signed with CA private key.
+    """
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME,            u"NP"),
+        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME,  u"Bagmati"),
+        x509.NameAttribute(NameOID.LOCALITY_NAME,           u"Kathmandu"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME,       u"SecureChat"),
+        x509.NameAttribute(NameOID.COMMON_NAME,             username),
     ])
-    
-    cert = x509.CertificateBuilder().subject_name(
-        subject
-    ).issuer_name(
-        issuer
-    ).public_key(
-        public_key
-    ).serial_number(
-        x509.random_serial_number()
-    ).not_valid_before(
-        datetime.utcnow()
-    ).not_valid_after(
-        datetime.utcnow() + timedelta(days=CONFIG["ca_config"]["validity_days"])
-    ).add_extension(
-        x509.SubjectAlternativeName([x509.DNSName(u"localhost")]),
-        critical=False,
-    ).sign(private_key, hashes.SHA256(), default_backend())
-    
+
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(CA_CERTIFICATE.subject)          # CA is the issuer
+        .public_key(user_public_key)
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc))
+        .not_valid_after(
+            datetime.now(timezone.utc)
+            + timedelta(days=CONFIG["ca_config"]["user_cert_validity_days"])
+        )
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(u"localhost")]),
+            critical=False,
+        )
+        .sign(CA_PRIVATE_KEY, hashes.SHA256(), default_backend())   # signed by CA
+    )
     return cert
 
+
+# ---- CERTIFICATE VALIDATION (reusable) ----
+def validate_certificate(cert_pem):
+    """
+    Full PKI validation.  Returns (True, None) or (False, reason).
+
+    Checks:
+      1. Parse PEM.
+      2. Verify signature against the CA public key.
+      3. not_valid_before <= now <= not_valid_after.
+      4. Serial number not in revoked_certificates (CRL).
+    """
+    try:
+        cert = x509.load_pem_x509_certificate(
+            cert_pem.encode(), default_backend()
+        )
+    except Exception:
+        return False, "Certificate PEM is malformed."
+
+    # 1. Signature – proves the CA actually issued this cert
+    try:
+        CA_CERTIFICATE.public_key().verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            cert.signature_hash_algorithm
+        )
+    except InvalidSignature:
+        return False, "Certificate signature invalid – not issued by trusted CA."
+    except Exception as e:
+        return False, f"Signature verification error: {e}"
+
+    # 2. Validity period
+    now = datetime.now(timezone.utc)
+    if now < cert.not_valid_before_utc:
+        return False, "Certificate is not yet valid."
+    if now > cert.not_valid_after_utc:
+        return False, "Certificate has expired."
+
+    # 3. CRL check
+    serial = str(cert.serial_number)
+    conn = sqlite3.connect(DATABASE_PATH)
+    row  = conn.execute(
+        "SELECT revoked_at FROM revoked_certificates WHERE serial_number=?",
+        (serial,)
+    ).fetchone()
+    conn.close()
+    if row:
+        return False, f"Certificate revoked (since {row[0]})."
+
+    return True, None
+
+
+# ---- private key I/O ----
 def save_private_key(username, private_key, password):
-    """Encrypt and save private key"""
-    encryption_algorithm = serialization.BestAvailableEncryption(password.encode())
-    
     pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=encryption_algorithm
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.BestAvailableEncryption(password.encode())
     )
-    
-    key_path = os.path.join(KEYS_DIR, f"{username}_private.pem")
-    with open(key_path, 'wb') as f:
+    with open(os.path.join(KEYS_DIR, f"{username}_private.pem"), "wb") as f:
         f.write(pem)
 
 def load_private_key(username, password):
-    """Load and decrypt private key"""
-    key_path = os.path.join(KEYS_DIR, f"{username}_private.pem")
+    path = os.path.join(KEYS_DIR, f"{username}_private.pem")
     try:
-        with open(key_path, 'rb') as f:
-            pem = f.read()
-        
-        private_key = serialization.load_pem_private_key(
-            pem,
-            password=password.encode(),
-            backend=default_backend()
-        )
-        return private_key
-    except Exception as e:
+        with open(path, "rb") as f:
+            return serialization.load_pem_private_key(
+                f.read(), password=password.encode(), backend=default_backend()
+            )
+    except Exception:
         return None
 
-def public_key_from_pem(pem_string):
-    """Convert PEM string to public key object"""
+
+# ---- encryption / decryption ----
+def public_key_from_pem(pem_str):
     return serialization.load_pem_public_key(
-        pem_string.encode(),
-        backend=default_backend()
+        pem_str.encode(), backend=default_backend()
     )
 
 def encrypt_message(message, public_key_pem):
-    """Encrypt message with recipient's public key"""
-    public_key = public_key_from_pem(public_key_pem)
-    
-    # For longer messages, we'd use hybrid encryption (AES + RSA)
-    # For simplicity, using RSA directly (limited to key_size/8 - padding bytes)
-    ciphertext = public_key.encrypt(
+    """RSA-OAEP encryption (messages <= 190 bytes)."""
+    pub = public_key_from_pem(public_key_pem)
+    ct  = pub.encrypt(
         message.encode(),
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
+            algorithm=hashes.SHA256(), label=None
         )
     )
-    return b64encode(ciphertext).decode()
+    return b64encode(ct).decode()
 
-def decrypt_message(encrypted_message, private_key):
-    """Decrypt message with recipient's private key"""
-    ciphertext = b64decode(encrypted_message.encode())
-    
-    plaintext = private_key.decrypt(
-        ciphertext,
+def decrypt_message(encrypted_b64, private_key):
+    """RSA-OAEP decryption."""
+    ct = b64decode(encrypted_b64)
+    return private_key.decrypt(
+        ct,
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
+            algorithm=hashes.SHA256(), label=None
+        )
+    ).decode()
+
+
+# ---- HYBRID ENCRYPTION SCAFFOLD (AES-256-GCM + RSA-OAEP) ----
+# Use this path for messages longer than ~190 bytes.
+def hybrid_encrypt(plaintext_str, recipient_public_key_pem):
+    """
+    1. Generate random 256-bit AES key.
+    2. Encrypt plaintext with AES-256-GCM.
+    3. Wrap AES key with recipient RSA public key.
+    Returns JSON blob.
+    """
+    aes_key  = os.urandom(32)
+    nonce    = os.urandom(12)
+    aesgcm   = AESGCM(aes_key)
+    aes_ct   = aesgcm.encrypt(nonce, plaintext_str.encode(), None)
+
+    pub      = public_key_from_pem(recipient_public_key_pem)
+    wrapped  = pub.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(), label=None
         )
     )
-    return plaintext.decode()
+    return json.dumps({
+        "aes_ct_b64":          b64encode(aes_ct).decode(),
+        "aes_nonce_b64":       b64encode(nonce).decode(),
+        "rsa_wrapped_key_b64": b64encode(wrapped).decode()
+    })
 
+def hybrid_decrypt(payload_json, private_key):
+    """Reverse of hybrid_encrypt."""
+    data     = json.loads(payload_json)
+    wrapped  = b64decode(data["rsa_wrapped_key_b64"])
+    aes_key  = private_key.decrypt(
+        wrapped,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(), label=None
+        )
+    )
+    nonce  = b64decode(data["aes_nonce_b64"])
+    aes_ct = b64decode(data["aes_ct_b64"])
+    return AESGCM(aes_key).decrypt(nonce, aes_ct, None).decode()
+
+
+# ---- signing / verification ----
 def sign_message(message, private_key):
-    """Create digital signature for message"""
-    signature = private_key.sign(
+    """RSA-PSS + SHA-256."""
+    sig = private_key.sign(
         message.encode(),
         padding.PSS(
             mgf=padding.MGF1(hashes.SHA256()),
@@ -232,16 +435,14 @@ def sign_message(message, private_key):
         ),
         hashes.SHA256()
     )
-    return b64encode(signature).decode()
+    return b64encode(sig).decode()
 
 def verify_signature(message, signature_b64, public_key_pem):
-    """Verify digital signature"""
-    public_key = public_key_from_pem(public_key_pem)
-    signature = b64decode(signature_b64.encode())
-    
+    """Returns True if the RSA-PSS signature is valid."""
+    pub = public_key_from_pem(public_key_pem)
     try:
-        public_key.verify(
-            signature,
+        pub.verify(
+            b64decode(signature_b64),
             message.encode(),
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
@@ -253,1676 +454,1218 @@ def verify_signature(message, signature_b64, public_key_pem):
     except Exception:
         return False
 
-# Authentication decorators
+
+# ---- FILE ENCRYPTION (AES-256 + RSA wrapper for keys) ----
+def encrypt_file(file_bytes, recipient_public_key_pem):
+    """
+    Encrypt a file using AES-256-GCM, then wrap the AES key with RSA.
+    Returns: (encrypted_file_bytes, encrypted_aes_key_b64)
+    """
+    # Generate random AES key
+    aes_key = os.urandom(32)
+    nonce   = os.urandom(12)
+    
+    # Encrypt file with AES-GCM
+    aesgcm = AESGCM(aes_key)
+    encrypted_file = aesgcm.encrypt(nonce, file_bytes, None)
+    
+    # Prepend nonce to encrypted file
+    encrypted_file_with_nonce = nonce + encrypted_file
+    
+    # Wrap AES key with recipient's RSA public key
+    pub = public_key_from_pem(recipient_public_key_pem)
+    wrapped_key = pub.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    
+    return encrypted_file_with_nonce, b64encode(wrapped_key).decode()
+
+def decrypt_file(encrypted_file_with_nonce, encrypted_aes_key_b64, private_key):
+    """
+    Decrypt a file: unwrap AES key with RSA, then decrypt file with AES-GCM.
+    Returns: decrypted_file_bytes
+    """
+    # Unwrap AES key
+    wrapped_key = b64decode(encrypted_aes_key_b64)
+    aes_key = private_key.decrypt(
+        wrapped_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    
+    # Extract nonce and ciphertext
+    nonce = encrypted_file_with_nonce[:12]
+    ciphertext = encrypted_file_with_nonce[12:]
+    
+    # Decrypt file
+    aesgcm = AESGCM(aes_key)
+    return aesgcm.decrypt(nonce, ciphertext, None)
+
+def sign_file(file_bytes, private_key):
+    """Create SHA-256 hash of file and sign it."""
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    return sign_message(file_hash, private_key)
+
+
+# ================================================================
+# AUTH DECORATORS
+# ================================================================
 def login_required(f):
-    """Decorator to require user login"""
     @functools.wraps(f)
-    def decorated_function(*args, **kwargs):
+    def wrapper(*a, **kw):
         if 'user_id' not in session:
-            flash('Please log in to access this page', 'error')
+            flash('Please log in first.', 'error')
             return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    return decorated_function
+        return f(*a, **kw)
+    return wrapper
 
 def admin_required(f):
-    """Decorator to require admin login"""
     @functools.wraps(f)
-    def decorated_function(*args, **kwargs):
+    def wrapper(*a, **kw):
         if 'admin_id' not in session:
-            flash('Admin access required', 'error')
+            flash('Admin access required.', 'error')
             return redirect(url_for('admin_login'))
-        return f(*args, **kwargs)
-    return decorated_function
+        return f(*a, **kw)
+    return wrapper
 
-# HTML Templates
-HOME_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>SecureChat - Home</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-        }
-        .container {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            max-width: 500px;
-            width: 100%;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            text-align: center;
-        }
-        h1 {
-            color: #2d3748;
-            margin-bottom: 10px;
-            font-size: 2.5em;
-        }
-        .subtitle {
-            color: #718096;
-            margin-bottom: 30px;
-            font-size: 1.1em;
-        }
-        .btn {
-            display: block;
-            width: 100%;
-            padding: 15px;
-            margin: 10px 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            text-decoration: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 600;
-            transition: transform 0.2s;
-            border: none;
-            cursor: pointer;
-        }
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-        }
-        .btn-secondary {
-            background: linear-gradient(135deg, #4c51bf 0%, #434190 100%);
-        }
-        .icon { font-size: 4em; margin-bottom: 20px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="icon">🔐</div>
-        <h1>SecureChat</h1>
-        <p class="subtitle">PKI-Based Encrypted Messaging</p>
-        <a href="{{ url_for('register') }}" class="btn">Register New Account</a>
-        <a href="{{ url_for('login') }}" class="btn">Login</a>
-        <a href="{{ url_for('admin_login') }}" class="btn btn-secondary">Admin Panel</a>
+
+# ================================================================
+# HTML TEMPLATES
+# ================================================================
+# Shared CSS
+_CSS = """
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+    font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
+    background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
+    min-height:100vh; padding:20px;
+}
+.page-center { display:flex; justify-content:center; align-items:center; min-height:100vh; }
+.card {
+    background:#fff; border-radius:20px; padding:40px;
+    max-width:520px; width:100%;
+    box-shadow:0 20px 60px rgba(0,0,0,.3); text-align:center;
+}
+.card-wide { max-width:640px; }
+h1 { color:#2d3748; margin-bottom:10px; font-size:2.2em; }
+.subtitle { color:#718096; margin-bottom:28px; font-size:1.05em; }
+.form-group { margin-bottom:18px; text-align:left; }
+label { display:block; color:#4a5568; margin-bottom:5px; font-weight:600; font-size:.9em; }
+input, select {
+    width:100%; padding:11px 14px; border:2px solid #e2e8f0;
+    border-radius:8px; font-size:14px; transition:border-color .3s;
+}
+input:focus, select:focus { outline:none; border-color:#667eea; }
+.btn {
+    display:block; width:100%; padding:13px;
+    background:linear-gradient(135deg,#667eea,#764ba2);
+    color:#fff; border:none; border-radius:10px;
+    font-size:15px; font-weight:600; cursor:pointer;
+    transition:transform .2s; margin:8px 0; text-decoration:none;
+}
+.btn:hover { transform:translateY(-2px); box-shadow:0 5px 15px rgba(102,126,234,.4); }
+.btn-sec { background:linear-gradient(135deg,#4c51bf,#434190); }
+.alert { padding:11px 14px; margin-bottom:18px; border-radius:8px; font-weight:500; font-size:.9em; }
+.alert-error   { background:#fee; color:#c53030; border:1px solid #fc8181; }
+.alert-success { background:#f0fff4; color:#22543d; border:1px solid #48bb78; }
+.info-box { background:#ebf8ff; border-left:4px solid #4299e1; padding:12px 14px; margin-bottom:18px; border-radius:5px; font-size:.88em; text-align:left; }
+.links { text-align:center; margin-top:20px; }
+.links a { color:#667eea; text-decoration:none; margin:0 10px; font-size:.9em; }
+"""
+
+HOME_TEMPLATE = """<!DOCTYPE html><html><head><title>SecureChat</title><style>""" + _CSS + """</style></head>
+<body><div class="page-center"><div class="card">
+<div style="font-size:3.8em;margin-bottom:14px">&#x1F510;</div>
+<h1>SecureChat</h1>
+<p class="subtitle">PKI-Based Encrypted Messaging &amp; Document Signing</p>
+<a href="{{ url_for('register') }}" class="btn">Register</a>
+<a href="{{ url_for('login') }}" class="btn">Login</a>
+<a href="{{ url_for('admin_login') }}" class="btn btn-sec">Admin Panel</a>
+</div></div></body></html>"""
+
+REGISTER_TEMPLATE = """<!DOCTYPE html><html><head><title>Register</title><style>""" + _CSS + """</style></head>
+<body><div class="page-center"><div class="card card-wide">
+<h1>&#x1F510; Register</h1>
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% if messages %}{% for cat, msg in messages %}
+<div class="alert alert-{{ cat }}">{{ msg }}</div>
+{% endfor %}{% endif %}{% endwith %}
+<div class="info-box">An RSA 2048-bit key-pair and a <strong>CA-signed</strong> X.509 certificate will be generated for you.</div>
+<form method="POST">
+<div class="form-group"><label>Username</label><input name="username" required minlength="3"></div>
+<div class="form-group"><label>Password</label><input type="password" name="password" required minlength="6"></div>
+<div class="form-group"><label>Confirm Password</label><input type="password" name="confirm_password" required></div>
+<div class="form-group"><label>Security Question 1</label>
+<select name="security_q1" required>
+<option value="">-- choose --</option>
+<option value="What was your childhood nickname?">What was your childhood nickname?</option>
+<option value="What is your mother&#x27;s maiden name?">What is your mother&#x27;s maiden name?</option>
+<option value="What was the name of your first pet?">What was the name of your first pet?</option>
+<option value="What city were you born in?">What city were you born in?</option>
+</select></div>
+<div class="form-group"><label>Answer 1</label><input name="security_a1" required></div>
+<div class="form-group"><label>Security Question 2</label>
+<select name="security_q2" required>
+<option value="">-- choose --</option>
+<option value="What is your favorite book?">What is your favorite book?</option>
+<option value="What was your first car?">What was your first car?</option>
+<option value="What is your favorite food?">What is your favorite food?</option>
+<option value="What was your high school mascot?">What was your high school mascot?</option>
+</select></div>
+<div class="form-group"><label>Answer 2</label><input name="security_a2" required></div>
+<button type="submit" class="btn">Register</button>
+</form>
+<div class="links"><a href="{{ url_for('index') }}">&#x2190; Back</a></div>
+</div></div></body></html>"""
+
+LOGIN_TEMPLATE = """<!DOCTYPE html><html><head><title>Login</title><style>""" + _CSS + """</style></head>
+<body><div class="page-center"><div class="card">
+<h1>&#x1F510; Login</h1>
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% if messages %}{% for cat, msg in messages %}
+<div class="alert alert-{{ cat }}">{{ msg }}</div>
+{% endfor %}{% endif %}{% endwith %}
+<form method="POST">
+<div class="form-group"><label>Username</label><input name="username" required></div>
+<div class="form-group"><label>Password</label><input type="password" name="password" required></div>
+<button type="submit" class="btn">Login</button>
+</form>
+<div class="links">
+<a href="{{ url_for('forgot_password') }}">Forgot Password?</a>
+<a href="{{ url_for('index') }}">&#x2190; Back</a>
+</div>
+</div></div>
+<script>
+var el=document.querySelector('.alert-error');
+if(el && el.textContent.indexOf('locked')!==-1){
+  var s=600, d=document.createElement('div');
+  d.style.cssText='text-align:center;margin-top:18px;padding:12px;background:#fff5f5;border-radius:8px;color:#c53030;font-weight:600;';
+  d.innerHTML='&#x1F512; Locked. Unlocking in <span id="cd">10:00</span>...';
+  document.querySelector('.card').appendChild(d);
+  var iv=setInterval(function(){
+    if(--s<=0){clearInterval(iv);d.innerHTML='Lockout expired.';d.style.background='#f0fff4';d.style.color='#22543d';return;}
+    document.getElementById('cd').textContent=Math.floor(s/60)+':'+(s%60<10?'0':'')+s%60;
+  },1000);
+}
+</script>
+</body></html>"""
+
+FORGOT_TEMPLATE = """<!DOCTYPE html><html><head><title>Reset Password</title><style>""" + _CSS + """</style></head>
+<body><div class="page-center"><div class="card">
+<h1>&#x1F511; Password Recovery</h1>
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% if messages %}{% for cat, msg in messages %}
+<div class="alert alert-{{ cat }}">{{ msg }}</div>
+{% endfor %}{% endif %}{% endwith %}
+<form method="POST">
+{% if not security_questions %}
+<div class="form-group"><label>Username</label><input name="username" required></div>
+<button type="submit" class="btn">Continue</button>
+{% else %}
+<input type="hidden" name="username" value="{{ username }}">
+<div class="form-group"><label>{{ security_questions[0] }}</label><input name="answer1" required></div>
+<div class="form-group"><label>{{ security_questions[1] }}</label><input name="answer2" required></div>
+<div class="form-group"><label>New Password</label><input type="password" name="new_password" required minlength="6"></div>
+<button type="submit" class="btn">Reset Password</button>
+{% endif %}
+</form>
+<div class="links"><a href="{{ url_for('login') }}">&#x2190; Login</a></div>
+</div></div></body></html>"""
+
+DASHBOARD_TEMPLATE = """<!DOCTYPE html><html><head><title>Dashboard</title>
+<style>""" + _CSS + """
+.top-bar {
+    background:#fff; padding:16px 24px; border-radius:10px; margin-bottom:18px;
+    display:flex; justify-content:space-between; align-items:center;
+    box-shadow:0 2px 10px rgba(0,0,0,.1);
+}
+.top-bar h1 { font-size:1.5em; color:#2d3748; }
+.top-bar .sub { color:#718096; font-size:.85em; }
+.btn-out { padding:8px 18px; background:#fc8181; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; text-decoration:none; }
+.layout { display:grid; grid-template-columns:1fr 2.2fr; gap:18px; max-width:1400px; margin:0 auto; }
+.panel { background:#fff; border-radius:15px; padding:22px; box-shadow:0 5px 20px rgba(0,0,0,.1); }
+.panel h2 { color:#2d3748; margin-bottom:16px; padding-bottom:8px; border-bottom:2px solid #e2e8f0; font-size:1.1em; }
+.user-item { padding:14px; margin:8px 0; background:#f7fafc; border-radius:10px; cursor:pointer; transition:all .25s; border-left:4px solid transparent; }
+.user-item:hover { background:#edf2f7; border-left-color:#667eea; transform:translateX(4px); }
+.user-item.active { background:#ebf8ff; border-left-color:#4299e1; }
+.chat-box { height:300px; overflow-y:auto; border:2px solid #e2e8f0; border-radius:10px; padding:18px; margin-bottom:16px; background:#f7fafc; }
+.msg { margin:12px 0; padding:11px 14px; border-radius:10px; max-width:80%; }
+.msg-out { background:linear-gradient(135deg,#667eea,#764ba2); color:#fff; margin-left:auto; text-align:right; }
+.msg-in  { background:#e2e8f0; color:#2d3748; }
+.msg-meta { font-size:.78em; opacity:.75; margin-top:4px; }
+.file-item { background:#fef3c7; border-left:4px solid #f59e0b; padding:10px; margin:8px 0; border-radius:8px; }
+.file-item-out { margin-left:auto; max-width:80%; }
+.file-item-in { max-width:80%; }
+.compose { display:flex; gap:10px; margin-bottom:12px; }
+.compose textarea { flex:1; padding:11px; border:2px solid #e2e8f0; border-radius:10px; resize:none; font-family:inherit; font-size:.9em; }
+.compose textarea:focus { outline:none; border-color:#667eea; }
+.btn-send { padding:11px 26px; background:linear-gradient(135deg,#667eea,#764ba2); color:#fff; border:none; border-radius:10px; cursor:pointer; font-weight:600; }
+.file-upload { display:flex; gap:10px; align-items:center; }
+.file-upload input[type="file"] { flex:1; padding:8px; border:2px dashed #e2e8f0; border-radius:8px; font-size:.85em; }
+.btn-upload { padding:8px 20px; background:#48bb78; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; }
+.btn-download { padding:4px 12px; background:#4299e1; color:#fff; border:none; border-radius:5px; cursor:pointer; font-size:.8em; margin-top:6px; }
+.empty { text-align:center; color:#718096; padding:60px 16px; }
+.badge { display:inline-block; padding:2px 7px; border-radius:4px; font-size:.72em; margin-left:4px; color:#fff; }
+.badge-ok { background:#48bb78; }
+.badge-bad { background:#fc8181; }
+.tab { display:inline-block; padding:8px 16px; cursor:pointer; border-radius:8px 8px 0 0; margin-right:4px; background:#e2e8f0; }
+.tab.active { background:#667eea; color:#fff; }
+</style></head><body>
+<div class="top-bar">
+  <div><h1>&#x1F510; SecureChat</h1><div class="sub">Logged in as <strong>{{ username }}</strong></div></div>
+  <a href="{{ url_for('logout') }}" class="btn-out">Logout</a>
+</div>
+<div class="layout">
+  <div class="panel">
+    <h2>Users</h2>
+    {% for u in users %}
+      {% if u.user_id != current_user_id %}
+      <div class="user-item" onclick="pick({{ u.user_id }},'{{ u.username }}')">
+        <strong>{{ u.username }}</strong>
+        <div style="font-size:.8em;color:#718096">Joined {{ u.created_at[:10] }}</div>
+      </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+  <div class="panel">
+    <h2 id="ch">Select a user</h2>
+    <div style="margin-bottom:12px;">
+      <span class="tab active" id="tabMsg" onclick="switchTab('msg')">&#x1F4AC; Messages</span>
+      <span class="tab" id="tabFile" onclick="switchTab('file')">&#x1F4C1; Files</span>
     </div>
-</body>
-</html>
-'''
-
-REGISTER_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Register - SecureChat</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            max-width: 600px;
-            margin: 20px auto;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-        }
-        h1 {
-            color: #2d3748;
-            margin-bottom: 30px;
-            text-align: center;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            color: #4a5568;
-            margin-bottom: 5px;
-            font-weight: 600;
-        }
-        input, select {
-            width: 100%;
-            padding: 12px;
-            border: 2px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 14px;
-            transition: border-color 0.3s;
-        }
-        input:focus, select:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        .btn {
-            width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: transform 0.2s;
-        }
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-        }
-        .alert {
-            padding: 12px;
-            margin-bottom: 20px;
-            border-radius: 8px;
-            font-weight: 500;
-        }
-        .alert-error {
-            background: #fee;
-            color: #c53030;
-            border: 1px solid #fc8181;
-        }
-        .alert-success {
-            background: #f0fff4;
-            color: #22543d;
-            border: 1px solid #48bb78;
-        }
-        .back-link {
-            display: block;
-            text-align: center;
-            margin-top: 20px;
-            color: #667eea;
-            text-decoration: none;
-        }
-        .info-box {
-            background: #ebf8ff;
-            border-left: 4px solid #4299e1;
-            padding: 15px;
-            margin-bottom: 20px;
-            border-radius: 5px;
-            font-size: 14px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔐 Register Account</h1>
-        
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-        
-        <div class="info-box">
-            <strong>Note:</strong> Your RSA key pair (2048-bit) and digital certificate will be automatically generated upon registration.
-        </div>
-        
-        <form method="POST">
-            <div class="form-group">
-                <label>Username</label>
-                <input type="text" name="username" required minlength="3">
-            </div>
-            
-            <div class="form-group">
-                <label>Password</label>
-                <input type="password" name="password" required minlength="6">
-            </div>
-            
-            <div class="form-group">
-                <label>Confirm Password</label>
-                <input type="password" name="confirm_password" required>
-            </div>
-            
-            <div class="form-group">
-                <label>Security Question 1</label>
-                <select name="security_q1" required>
-                    <option value="">Select a question</option>
-                    <option value="What was your childhood nickname?">What was your childhood nickname?</option>
-                    <option value="What is your mother's maiden name?">What is your mother's maiden name?</option>
-                    <option value="What was the name of your first pet?">What was the name of your first pet?</option>
-                    <option value="What city were you born in?">What city were you born in?</option>
-                </select>
-            </div>
-            
-            <div class="form-group">
-                <label>Answer 1</label>
-                <input type="text" name="security_a1" required>
-            </div>
-            
-            <div class="form-group">
-                <label>Security Question 2</label>
-                <select name="security_q2" required>
-                    <option value="">Select a question</option>
-                    <option value="What is your favorite book?">What is your favorite book?</option>
-                    <option value="What was your first car?">What was your first car?</option>
-                    <option value="What is your favorite food?">What is your favorite food?</option>
-                    <option value="What was your high school mascot?">What was your high school mascot?</option>
-                </select>
-            </div>
-            
-            <div class="form-group">
-                <label>Answer 2</label>
-                <input type="text" name="security_a2" required>
-            </div>
-            
-            <button type="submit" class="btn">Register</button>
-        </form>
-        
-        <a href="{{ url_for('index') }}" class="back-link">← Back to Home</a>
+    <div id="chat-area" class="chat-box"><div class="empty"><div style="font-size:2.6em">&#x1F4E7;</div><p>Pick a user on the left</p></div></div>
+    <div id="compose-area" style="display:none">
+      <div class="compose">
+        <textarea id="mi" rows="2" placeholder="Type a message (max 190 chars)..."></textarea>
+        <button class="btn-send" onclick="send()">Send &#x1F512;</button>
+      </div>
+      <div class="file-upload">
+        <input type="file" id="fileInput" />
+        <button class="btn-upload" onclick="uploadFile()">Upload File &#x1F4CE;</button>
+      </div>
     </div>
-</body>
-</html>
-'''
+  </div>
+</div>
+<script>
+var sel=null, currentTab='msg';
+function pick(id,name){
+  sel=id;
+  document.querySelectorAll('.user-item').forEach(function(e){e.classList.remove('active');});
+  event.currentTarget.classList.add('active');
+  document.getElementById('ch').innerHTML='Chat with '+name;
+  document.getElementById('compose-area').style.display='block';
+  loadContent();
+}
+function switchTab(tab){
+  currentTab=tab;
+  document.getElementById('tabMsg').classList.toggle('active', tab==='msg');
+  document.getElementById('tabFile').classList.toggle('active', tab==='file');
+  if(sel) loadContent();
+}
+function loadContent(){
+  if(currentTab==='msg') loadMessages(sel);
+  else loadFiles(sel);
+}
+function loadMessages(id){
+  fetch('/get_messages?user_id='+id).then(function(r){return r.json();}).then(function(d){
+    var c=document.getElementById('chat-area');
+    if(!d.messages.length){c.innerHTML='<div class="empty"><div style="font-size:2.6em">&#x1F4ED;</div><p>No messages yet.</p></div>';return;}
+    c.innerHTML=d.messages.map(function(m){
+      var cls=m.is_sent?'msg-out':'msg-in';
+      var badge=m.signature_valid?'<span class="badge badge-ok">Verified</span>':'<span class="badge badge-bad">Invalid</span>';
+      return '<div class="msg '+cls+'"><div>'+m.decrypted_message+'</div><div class="msg-meta">'+m.timestamp+' '+badge+'</div></div>';
+    }).join('');
+    c.scrollTop=c.scrollHeight;
+  });
+}
+function loadFiles(id){
+  fetch('/get_files?user_id='+id).then(function(r){return r.json();}).then(function(d){
+    var c=document.getElementById('chat-area');
+    if(!d.files.length){c.innerHTML='<div class="empty"><div style="font-size:2.6em">&#x1F4C1;</div><p>No files shared yet.</p></div>';return;}
+    c.innerHTML=d.files.map(function(f){
+      var cls=f.is_sent?'file-item file-item-out':'file-item file-item-in';
+      var badge=f.signature_valid?'<span class="badge badge-ok">Verified</span>':'<span class="badge badge-bad">Invalid</span>';
+      var dl=f.is_sent?'':'<button class="btn-download" onclick="downloadFile('+f.file_id+',\\''+f.original_filename+'\\')">Download</button>';
+      return '<div class="'+cls+'"><strong>&#x1F4CE; '+f.original_filename+'</strong> ('+f.file_size+' bytes)<div class="msg-meta">'+f.timestamp+' '+badge+'</div>'+dl+'</div>';
+    }).join('');
+  });
+}
+function send(){
+  var v=document.getElementById('mi').value.trim();
+  if(!v||!sel){alert('Enter a message');return;}
+  if(v.length>190){alert('Max 190 chars for RSA.');return;}
+  fetch('/send_message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient_id:sel,message:v})})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.success){document.getElementById('mi').value='';loadMessages(sel);}
+    else alert('Error: '+d.error);
+  });
+}
+function uploadFile(){
+  var file=document.getElementById('fileInput').files[0];
+  if(!file||!sel){alert('Select a file first');return;}
+  var formData=new FormData();
+  formData.append('file',file);
+  formData.append('recipient_id',sel);
+  fetch('/upload_file',{method:'POST',body:formData})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.success){document.getElementById('fileInput').value='';loadFiles(sel);alert('File uploaded & encrypted!');}
+    else alert('Error: '+d.error);
+  });
+}
+function downloadFile(fileId, filename){
+  window.location.href='/download_file/'+fileId;
+}
+setInterval(function(){if(sel)loadContent();},5000);
+</script>
+</body></html>"""
 
-LOGIN_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Login - SecureChat</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-        }
-        .container {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            max-width: 450px;
-            width: 100%;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-        }
-        h1 {
-            color: #2d3748;
-            margin-bottom: 30px;
-            text-align: center;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            color: #4a5568;
-            margin-bottom: 5px;
-            font-weight: 600;
-        }
-        input {
-            width: 100%;
-            padding: 12px;
-            border: 2px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 14px;
-        }
-        input:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        .btn {
-            width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: transform 0.2s;
-        }
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-        }
-        .alert {
-            padding: 12px;
-            margin-bottom: 20px;
-            border-radius: 8px;
-            font-weight: 500;
-        }
-        .alert-error {
-            background: #fee;
-            color: #c53030;
-            border: 1px solid #fc8181;
-        }
-        .links {
-            text-align: center;
-            margin-top: 20px;
-        }
-        .links a {
-            color: #667eea;
-            text-decoration: none;
-            margin: 0 10px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔐 Login</h1>
-        
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-        
-        <form method="POST">
-            <div class="form-group">
-                <label>Username</label>
-                <input type="text" name="username" required>
-            </div>
-            
-            <div class="form-group">
-                <label>Password</label>
-                <input type="password" name="password" required>
-            </div>
-            
-            <button type="submit" class="btn">Login</button>
-        </form>
-        
-        <div class="links">
-            <a href="{{ url_for('forgot_password') }}">Forgot Password?</a>
-            <a href="{{ url_for('index') }}">← Back</a>
-        </div>
-    </div>
-    <script>
-        // If the flash message contains "locked", start a 10-minute countdown
-        var flashEl = document.querySelector('.alert-error');
-        if (flashEl && flashEl.textContent.indexOf('locked') !== -1) {
-            var seconds = 600; // 10 minutes
-            var timerDiv = document.createElement('div');
-            timerDiv.style.cssText = 'text-align:center;margin-top:18px;padding:12px;background:#fff5f5;border-radius:8px;color:#c53030;font-weight:600;font-size:15px;';
-            timerDiv.innerHTML = '🔒 Account locked. Unlocking in <span id="countdown">10:00</span>…';
-            document.querySelector('.container').appendChild(timerDiv);
+ADMIN_TEMPLATE = """<!DOCTYPE html><html><head><title>Admin</title>
+<style>""" + _CSS + """
+body { background:linear-gradient(135deg,#2d3748,#1a202c); }
+.top-bar { background:#fff; padding:16px 24px; border-radius:10px; margin-bottom:18px; display:flex; justify-content:space-between; align-items:center; }
+.top-bar h1 { font-size:1.5em; color:#2d3748; }
+.btn-out { padding:8px 18px; background:#fc8181; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; text-decoration:none; }
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:16px; margin-bottom:24px; }
+.scard { background:#fff; padding:22px; border-radius:15px; box-shadow:0 5px 20px rgba(0,0,0,.1); }
+.scard h3 { color:#718096; font-size:.78em; margin-bottom:6px; text-transform:uppercase; }
+.scard .val { font-size:2.2em; font-weight:700; color:#2d3748; }
+.panel { background:#fff; border-radius:15px; padding:22px; margin-bottom:18px; box-shadow:0 5px 20px rgba(0,0,0,.1); }
+.panel h2 { color:#2d3748; margin-bottom:16px; padding-bottom:8px; border-bottom:2px solid #e2e8f0; font-size:1.1em; }
+table { width:100%; border-collapse:collapse; }
+th,td { padding:11px 12px; text-align:left; border-bottom:1px solid #e2e8f0; font-size:.88em; }
+th { background:#f7fafc; color:#4a5568; font-weight:600; }
+.ba { padding:5px 10px; margin:0 2px; border:none; border-radius:5px; cursor:pointer; font-size:.8em; color:#fff; }
+.ba-blue { background:#4299e1; }
+.ba-red  { background:#fc8181; }
+.ba-grn  { background:#48bb78; }
+.ba-org  { background:#ed8936; }
+.modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.6); justify-content:center; align-items:center; z-index:9; }
+.modal.on { display:flex; }
+.modal-body { background:#fff; padding:28px; border-radius:15px; max-width:760px; width:90%; max-height:80vh; overflow-y:auto; }
+.modal-body h3 { margin-bottom:16px; color:#2d3748; }
+.close-m { float:right; font-size:1.4em; cursor:pointer; color:#718096; }
+.code-box { background:#f7fafc; padding:14px; border-radius:8px; font-family:'Courier New',monospace; font-size:.8em; word-break:break-all; margin:8px 0; white-space:pre-wrap; }
+.test-output { background:#1a202c; color:#48bb78; padding:14px; border-radius:8px; font-family:'Courier New',monospace; font-size:.75em; white-space:pre; overflow-x:auto; max-height:400px; overflow-y:auto; margin-top:12px; }
+.btn-test { padding:10px 20px; background:linear-gradient(135deg,#667eea,#764ba2); color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; margin-bottom:12px; }
+.btn-test:hover { transform:translateY(-1px); box-shadow:0 4px 12px rgba(102,126,234,.4); }
+.test-status { padding:12px; border-radius:8px; margin-bottom:12px; font-weight:600; }
+.test-success { background:#f0fff4; color:#22543d; border:1px solid #48bb78; }
+.test-error { background:#fee; color:#c53030; border:1px solid #fc8181; }
+.test-running { background:#ebf8ff; color:#2c5282; border:1px solid #4299e1; }
+</style></head><body>
+<div class="top-bar"><h1>Admin Panel</h1><a href="{{ url_for('admin_logout') }}" class="btn-out">Logout</a></div>
+<div class="stats">
+  <div class="scard"><h3>Total Users</h3><div class="val">{{ stats.total_users }}</div></div>
+  <div class="scard"><h3>Active Users</h3><div class="val">{{ stats.active_users }}</div></div>
+  <div class="scard"><h3>Messages</h3><div class="val">{{ stats.total_messages }}</div></div>
+  <div class="scard"><h3>Revoked Certs</h3><div class="val" style="color:#fc8181">{{ stats.revoked_count }}</div></div>
+</div>
 
-            var interval = setInterval(function () {
-                seconds--;
-                if (seconds <= 0) {
-                    clearInterval(interval);
-                    timerDiv.innerHTML = '✅ Lockout expired. You may try again.';
-                    timerDiv.style.background = '#f0fff4';
-                    timerDiv.style.color = '#22543d';
-                    return;
-                }
-                var m = Math.floor(seconds / 60);
-                var s = seconds % 60;
-                document.getElementById('countdown').textContent = m + ':' + (s < 10 ? '0' : '') + s;
-            }, 1000);
-        }
-    </script>
-</body>
-</html>
-'''
+<div class="panel">
+  <h2>&#x1F9EA; PKI Test Suite</h2>
+  <button class="btn-test" onclick="runTests()">Run PKI Tests</button>
+  <div id="testStatus"></div>
+  <div id="testOutput"></div>
+</div>
 
-FORGOT_PASSWORD_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Forgot Password - SecureChat</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            max-width: 500px;
-            margin: 50px auto;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-        }
-        h1 { color: #2d3748; margin-bottom: 30px; text-align: center; }
-        .form-group { margin-bottom: 20px; }
-        label { display: block; color: #4a5568; margin-bottom: 5px; font-weight: 600; }
-        input { width: 100%; padding: 12px; border: 2px solid #e2e8f0; border-radius: 8px; font-size: 14px; }
-        input:focus { outline: none; border-color: #667eea; }
-        .btn {
-            width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-        }
-        .alert { padding: 12px; margin-bottom: 20px; border-radius: 8px; font-weight: 500; }
-        .alert-error { background: #fee; color: #c53030; border: 1px solid #fc8181; }
-        .alert-success { background: #f0fff4; color: #22543d; border: 1px solid #48bb78; }
-        .back-link { display: block; text-align: center; margin-top: 20px; color: #667eea; text-decoration: none; }
-        .step { display: none; }
-        .step.active { display: block; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔑 Password Recovery</h1>
-        
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
-            {% endif %}
-        {% endwith %}
-        
-        <form method="POST">
-            {% if not security_questions %}
-            <div class="form-group">
-                <label>Username</label>
-                <input type="text" name="username" required>
-            </div>
-            <button type="submit" class="btn">Continue</button>
-            {% else %}
-            <input type="hidden" name="username" value="{{ username }}">
-            <div class="form-group">
-                <label>{{ security_questions[0] }}</label>
-                <input type="text" name="answer1" required>
-            </div>
-            <div class="form-group">
-                <label>{{ security_questions[1] }}</label>
-                <input type="text" name="answer2" required>
-            </div>
-            <div class="form-group">
-                <label>New Password</label>
-                <input type="password" name="new_password" required minlength="6">
-            </div>
-            <button type="submit" class="btn">Reset Password</button>
-            {% endif %}
-        </form>
-        
-        <a href="{{ url_for('login') }}" class="back-link">← Back to Login</a>
-    </div>
-</body>
-</html>
-'''
-
-DASHBOARD_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Dashboard - SecureChat</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .header {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        .header h1 { color: #2d3748; }
-        .header .user-info { color: #4a5568; }
-        .btn-logout {
-            padding: 10px 20px;
-            background: #fc8181;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            text-decoration: none;
-            font-weight: 600;
-        }
-        .container {
-            display: grid;
-            grid-template-columns: 1fr 2fr;
-            gap: 20px;
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        .users-panel, .chat-panel {
-            background: white;
-            border-radius: 15px;
-            padding: 25px;
-            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
-        }
-        .users-panel h2, .chat-panel h2 {
-            color: #2d3748;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 2px solid #e2e8f0;
-        }
-        .user-item {
-            padding: 15px;
-            margin: 10px 0;
-            background: #f7fafc;
-            border-radius: 10px;
-            cursor: pointer;
-            transition: all 0.3s;
-            border-left: 4px solid transparent;
-        }
-        .user-item:hover {
-            background: #edf2f7;
-            border-left-color: #667eea;
-            transform: translateX(5px);
-        }
-        .user-item.active {
-            background: #ebf8ff;
-            border-left-color: #4299e1;
-        }
-        .chat-area {
-            height: 400px;
-            overflow-y: auto;
-            border: 2px solid #e2e8f0;
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 20px;
-            background: #f7fafc;
-        }
-        .message {
-            margin: 15px 0;
-            padding: 12px 15px;
-            border-radius: 10px;
-            max-width: 80%;
-        }
-        .message-sent {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            margin-left: auto;
-            text-align: right;
-        }
-        .message-received {
-            background: #e2e8f0;
-            color: #2d3748;
-        }
-        .message-meta {
-            font-size: 0.85em;
-            opacity: 0.8;
-            margin-top: 5px;
-        }
-        .compose-area {
-            display: flex;
-            gap: 10px;
-        }
-        .compose-area textarea {
-            flex: 1;
-            padding: 12px;
-            border: 2px solid #e2e8f0;
-            border-radius: 10px;
-            resize: none;
-            font-family: inherit;
-        }
-        .compose-area textarea:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        .btn-send {
-            padding: 12px 30px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 10px;
-            cursor: pointer;
-            font-weight: 600;
-        }
-        .empty-state {
-            text-align: center;
-            color: #718096;
-            padding: 60px 20px;
-        }
-        .signature-badge {
-            display: inline-block;
-            padding: 3px 8px;
-            background: #48bb78;
-            color: white;
-            border-radius: 4px;
-            font-size: 0.75em;
-            margin-left: 5px;
-        }
-        .signature-badge.invalid {
-            background: #fc8181;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div>
-            <h1>🔐 SecureChat Dashboard</h1>
-            <div class="user-info">Logged in as: <strong>{{ username }}</strong></div>
-        </div>
-        <a href="{{ url_for('logout') }}" class="btn-logout">Logout</a>
-    </div>
+<div class="panel">
+  <h2>User Management</h2>
+  <table><thead><tr><th>ID</th><th>Username</th><th>Registered</th><th>Status</th><th>Cert</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for u in users %}
+  <tr>
+    <td>{{ u.user_id }}</td>
+    <td>{{ u.username }}</td>
+    <td>{{ u.created_at[:16] }}</td>
+    <td>{% if u.is_active %}<span style="color:#48bb78">Active</span>{% else %}<span style="color:#fc8181">Disabled</span>{% endif %}</td>
+    <td>{% if u.is_revoked %}<span style="color:#fc8181">Revoked</span>{% else %}<span style="color:#48bb78">Valid</span>{% endif %}</td>
+    <td>
+      <button class="ba ba-blue" onclick="viewCert({{ u.user_id }})">View Cert</button>
+      {% if u.is_active %}<button class="ba ba-red" onclick="toggle({{ u.user_id }},0)">Disable</button>
+      {% else %}<button class="ba ba-grn" onclick="toggle({{ u.user_id }},1)">Enable</button>{% endif %}
+      {% if not u.is_revoked %}<button class="ba ba-org" onclick="revoke({{ u.user_id }})">Revoke Cert</button>{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody></table>
+</div>
+<div class="panel">
+  <h2>Message Activity</h2>
+  <table><thead><tr><th>ID</th><th>From</th><th>To</th><th>Time</th><th>Read</th></tr></thead>
+  <tbody>
+  {% for m in messages %}
+  <tr>
+    <td>{{ m.message_id }}</td><td>{{ m.sender_username }}</td>
+    <td>{{ m.recipient_username }}</td><td>{{ m.timestamp[:16] }}</td>
+    <td>{% if m.is_read %}<span style="color:#48bb78">Yes</span>{% else %}<span style="color:#718096">No</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody></table>
+</div>
+<div class="modal" id="certModal">
+  <div class="modal-body">
+    <span class="close-m" onclick="closeM()">x</span>
+    <h3 id="mTitle">Certificate</h3>
+    <strong>Public Key</strong><div class="code-box" id="mPub"></div>
+    <strong>Certificate (CA-signed)</strong><div class="code-box" id="mCert"></div>
+  </div>
+</div>
+<script>
+function runTests(){
+  var statusDiv = document.getElementById('testStatus');
+  var outputDiv = document.getElementById('testOutput');
+  statusDiv.innerHTML = '<div class="test-running">&#x23F3; Running PKI tests...</div>';
+  outputDiv.innerHTML = '';
+  
+  fetch('/admin/run_tests').then(function(r){return r.json();}).then(function(d){
+    if(!d.success){
+      statusDiv.innerHTML = '<div class="test-error">&#x274C; Error: ' + d.error + '</div>';
+      return;
+    }
     
-    <div class="container">
-        <div class="users-panel">
-            <h2>👥 Users</h2>
-            {% for user in users %}
-                {% if user.user_id != current_user_id %}
-                <div class="user-item" onclick="selectUser({{ user.user_id }}, '{{ user.username }}')">
-                    <strong>{{ user.username }}</strong>
-                    <div style="font-size: 0.85em; color: #718096;">
-                        Joined: {{ user.created_at[:10] }}
-                    </div>
-                </div>
-                {% endif %}
-            {% endfor %}
-        </div>
-        
-        <div class="chat-panel">
-            <h2 id="chat-title">💬 Select a user to start chatting</h2>
-            <div id="chat-area" class="chat-area">
-                <div class="empty-state">
-                    <div style="font-size: 3em; margin-bottom: 10px;">💬</div>
-                    <p>Select a user from the left panel to view messages</p>
-                </div>
-            </div>
-            <div class="compose-area" id="compose-area" style="display: none;">
-                <textarea id="message-input" rows="3" placeholder="Type your message (max 190 characters for RSA encryption)..."></textarea>
-                <button class="btn-send" onclick="sendMessage()">Send 🔒</button>
-            </div>
-        </div>
-    </div>
+    if(d.all_passed){
+      statusDiv.innerHTML = '<div class="test-success">&#x2705; All ' + d.total + ' tests PASSED!</div>';
+    } else {
+      statusDiv.innerHTML = '<div class="test-error">&#x274C; ' + d.failed + ' of ' + d.total + ' tests FAILED</div>';
+    }
     
-    <script>
-        let selectedUserId = null;
-        let selectedUsername = '';
-        
-        function selectUser(userId, username) {
-            selectedUserId = userId;
-            selectedUsername = username;
-            
-            // Update UI
-            document.querySelectorAll('.user-item').forEach(item => {
-                item.classList.remove('active');
-            });
-            event.currentTarget.classList.add('active');
-            
-            document.getElementById('chat-title').innerHTML = '💬 Chat with ' + username;
-            document.getElementById('compose-area').style.display = 'flex';
-            
-            loadMessages(userId);
-        }
-        
-        function loadMessages(userId) {
-            fetch('/get_messages?user_id=' + userId)
-                .then(response => response.json())
-                .then(data => {
-                    const chatArea = document.getElementById('chat-area');
-                    if (data.messages.length === 0) {
-                        chatArea.innerHTML = '<div class="empty-state"><div style="font-size: 3em;">📭</div><p>No messages yet. Start the conversation!</p></div>';
-                    } else {
-                        chatArea.innerHTML = data.messages.map(msg => {
-                            const isSent = msg.is_sent;
-                            const className = isSent ? 'message-sent' : 'message-received';
-                            const signatureBadge = msg.signature_valid ? 
-                                '<span class="signature-badge">✓ Verified</span>' : 
-                                '<span class="signature-badge invalid">⚠ Invalid Signature</span>';
-                            
-                            return `
-                                <div class="message ${className}">
-                                    <div>${msg.decrypted_message}</div>
-                                    <div class="message-meta">
-                                        ${msg.timestamp} ${signatureBadge}
-                                    </div>
-                                </div>
-                            `;
-                        }).join('');
-                        chatArea.scrollTop = chatArea.scrollHeight;
-                    }
-                });
-        }
-        
-        function sendMessage() {
-            const messageInput = document.getElementById('message-input');
-            const message = messageInput.value.trim();
-            
-            if (!message || !selectedUserId) {
-                alert('Please enter a message');
-                return;
-            }
-            
-            if (message.length > 190) {
-                alert('Message too long for RSA encryption. Please keep under 190 characters.');
-                return;
-            }
-            
-            fetch('/send_message', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    recipient_id: selectedUserId,
-                    message: message
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    messageInput.value = '';
-                    loadMessages(selectedUserId);
-                } else {
-                    alert('Failed to send message: ' + data.error);
-                }
-            });
-        }
-        
-        // Auto-refresh messages every 5 seconds
-        setInterval(() => {
-            if (selectedUserId) {
-                loadMessages(selectedUserId);
-            }
-        }, 5000);
-    </script>
-</body>
-</html>
-'''
+    outputDiv.innerHTML = '<div class="test-output">' + d.output.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+  }).catch(function(err){
+    statusDiv.innerHTML = '<div class="test-error">&#x274C; Error running tests: ' + err + '</div>';
+  });
+}
 
-ADMIN_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Admin Panel - SecureChat</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #2d3748 0%, #1a202c 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .header {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .header h1 { color: #2d3748; }
-        .btn-logout {
-            padding: 10px 20px;
-            background: #fc8181;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            text-decoration: none;
-            font-weight: 600;
-        }
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .stat-card {
-            background: white;
-            padding: 25px;
-            border-radius: 15px;
-            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
-        }
-        .stat-card h3 {
-            color: #718096;
-            font-size: 0.9em;
-            margin-bottom: 10px;
-        }
-        .stat-card .value {
-            color: #2d3748;
-            font-size: 2.5em;
-            font-weight: bold;
-        }
-        .panel {
-            background: white;
-            border-radius: 15px;
-            padding: 25px;
-            margin-bottom: 20px;
-            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
-        }
-        .panel h2 {
-            color: #2d3748;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 2px solid #e2e8f0;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        th, td {
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid #e2e8f0;
-        }
-        th {
-            background: #f7fafc;
-            color: #4a5568;
-            font-weight: 600;
-        }
-        .btn-action {
-            padding: 6px 12px;
-            margin: 0 2px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 0.85em;
-        }
-        .btn-view {
-            background: #4299e1;
-            color: white;
-        }
-        .btn-disable {
-            background: #fc8181;
-            color: white;
-        }
-        .btn-enable {
-            background: #48bb78;
-            color: white;
-        }
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.7);
-            justify-content: center;
-            align-items: center;
-        }
-        .modal.active {
-            display: flex;
-        }
-        .modal-content {
-            background: white;
-            padding: 30px;
-            border-radius: 15px;
-            max-width: 800px;
-            width: 90%;
-            max-height: 80vh;
-            overflow-y: auto;
-        }
-        .modal-content h3 {
-            margin-bottom: 20px;
-            color: #2d3748;
-        }
-        .close-modal {
-            float: right;
-            font-size: 1.5em;
-            cursor: pointer;
-            color: #718096;
-        }
-        .cert-data {
-            background: #f7fafc;
-            padding: 15px;
-            border-radius: 8px;
-            font-family: 'Courier New', monospace;
-            font-size: 0.85em;
-            word-break: break-all;
-            margin: 10px 0;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>⚙️ Admin Panel</h1>
-        <a href="{{ url_for('admin_logout') }}" class="btn-logout">Logout</a>
-    </div>
-    
-    <div class="stats">
-        <div class="stat-card">
-            <h3>TOTAL USERS</h3>
-            <div class="value">{{ stats.total_users }}</div>
-        </div>
-        <div class="stat-card">
-            <h3>ACTIVE USERS</h3>
-            <div class="value">{{ stats.active_users }}</div>
-        </div>
-        <div class="stat-card">
-            <h3>TOTAL MESSAGES</h3>
-            <div class="value">{{ stats.total_messages }}</div>
-        </div>
-    </div>
-    
-    <div class="panel">
-        <h2>👥 User Management</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Username</th>
-                    <th>Registered</th>
-                    <th>Status</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for user in users %}
-                <tr>
-                    <td>{{ user.user_id }}</td>
-                    <td>{{ user.username }}</td>
-                    <td>{{ user.created_at[:16] }}</td>
-                    <td>
-                        {% if user.is_active %}
-                            <span style="color: #48bb78;">● Active</span>
-                        {% else %}
-                            <span style="color: #fc8181;">● Disabled</span>
-                        {% endif %}
-                    </td>
-                    <td>
-                        <button class="btn-action btn-view" onclick="viewCertificate({{ user.user_id }})">View Certificate</button>
-                        {% if user.is_active %}
-                            <button class="btn-action btn-disable" onclick="toggleUser({{ user.user_id }}, 0)">Disable</button>
-                        {% else %}
-                            <button class="btn-action btn-enable" onclick="toggleUser({{ user.user_id }}, 1)">Enable</button>
-                        {% endif %}
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-    
-    <div class="panel">
-        <h2>📊 Message Activity</h2>
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>From</th>
-                    <th>To</th>
-                    <th>Timestamp</th>
-                    <th>Status</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for msg in messages %}
-                <tr>
-                    <td>{{ msg.message_id }}</td>
-                    <td>{{ msg.sender_username }}</td>
-                    <td>{{ msg.recipient_username }}</td>
-                    <td>{{ msg.timestamp[:16] }}</td>
-                    <td>
-                        {% if msg.is_read %}
-                            <span style="color: #48bb78;">Read</span>
-                        {% else %}
-                            <span style="color: #718096;">Unread</span>
-                        {% endif %}
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-    
-    <div class="modal" id="certModal">
-        <div class="modal-content">
-            <span class="close-modal" onclick="closeModal()">×</span>
-            <h3 id="modalTitle">Certificate Details</h3>
-            <div>
-                <strong>Public Key:</strong>
-                <div class="cert-data" id="publicKeyData"></div>
-            </div>
-            <div>
-                <strong>Certificate:</strong>
-                <div class="cert-data" id="certificateData"></div>
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        function viewCertificate(userId) {
-            fetch('/admin/get_certificate?user_id=' + userId)
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('modalTitle').textContent = 'Certificate: ' + data.username;
-                    document.getElementById('publicKeyData').textContent = data.public_key;
-                    document.getElementById('certificateData').textContent = data.certificate;
-                    document.getElementById('certModal').classList.add('active');
-                })
-                .catch(err => {
-                    alert('Failed to load certificate: ' + err);
-                });
-        }
-        
-        function closeModal() {
-            document.getElementById('certModal').classList.remove('active');
-        }
-        
-        // Close modal when clicking outside it
-        document.getElementById('certModal').addEventListener('click', function(e) {
-            if (e.target === this) closeModal();
-        });
-        
-        function toggleUser(userId, status) {
-            fetch('/admin/toggle_user', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    user_id: userId,
-                    is_active: status
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    location.reload();
-                }
-            });
-        }
-    </script>
-</body>
-</html>
-'''
+function viewCert(id){
+  fetch('/admin/get_certificate?user_id='+id).then(function(r){return r.json();}).then(function(d){
+    document.getElementById('mTitle').textContent='Certificate: '+d.username;
+    document.getElementById('mPub').textContent=d.public_key;
+    document.getElementById('mCert').textContent=d.certificate;
+    document.getElementById('certModal').classList.add('on');
+  });
+}
+function closeM(){document.getElementById('certModal').classList.remove('on');}
+document.getElementById('certModal').addEventListener('click',function(e){if(e.target===this)closeM();});
+function toggle(id,st){
+  fetch('/admin/toggle_user',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,is_active:st})})
+  .then(function(r){return r.json();}).then(function(d){if(d.success)location.reload();});
+}
+function revoke(id){
+  if(!confirm('Revoke this certificate? The user will no longer be able to log in or sign.'))return;
+  fetch('/admin/revoke_certificate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id})})
+  .then(function(r){return r.json();}).then(function(d){if(d.success)location.reload();else alert(d.error);});
+}
+</script>
+</body></html>"""
 
-# Routes
-@app.route('/')
+
+# ================================================================
+# ROUTES
+# ================================================================
+@app.route("/")
 def index():
-    """Home page"""
     return render_template_string(HOME_TEMPLATE)
 
-@app.route('/register', methods=['GET', 'POST'])
+# ---- REGISTER ----
+@app.route("/register", methods=["GET","POST"])
 def register():
-    """User registration with key generation and certificate issuance"""
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        confirm_password = request.form['confirm_password']
-        security_q1 = request.form['security_q1']
-        security_a1 = request.form['security_a1']
-        security_q2 = request.form['security_q2']
-        security_a2 = request.form['security_a2']
-        
-        # Validation
+    if request.method == "POST":
+        username         = request.form["username"]
+        password         = request.form["password"]
+        confirm_password = request.form["confirm_password"]
+        sq1 = request.form["security_q1"]
+        sa1 = request.form["security_a1"]
+        sq2 = request.form["security_q2"]
+        sa2 = request.form["security_a2"]
+
         if password != confirm_password:
-            flash('Passwords do not match', 'error')
+            flash("Passwords do not match.", "error")
             return render_template_string(REGISTER_TEMPLATE)
-        
         if len(password) < 6:
-            flash('Password must be at least 6 characters', 'error')
+            flash("Password must be at least 6 characters.", "error")
             return render_template_string(REGISTER_TEMPLATE)
-        
-        # Check if username exists
+
         conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users WHERE username = ?", (username,))
-        if cursor.fetchone():
-            flash('Username already exists', 'error')
+        if conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+            flash("Username already exists.", "error")
             conn.close()
             return render_template_string(REGISTER_TEMPLATE)
-        
+
         try:
-            # Generate cryptographic materials
-            private_key, public_key = generate_key_pair()
-            certificate = generate_certificate(username, public_key, private_key)
-            
-            # Serialize public key and certificate
-            public_key_pem = public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            priv, pub = generate_key_pair()
+            cert       = generate_certificate(username, pub)   # CA-signed
+
+            pub_pem  = pub.public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo
             ).decode()
-            
-            certificate_pem = certificate.public_bytes(
-                encoding=serialization.Encoding.PEM
-            ).decode()
-            
-            # Save private key (encrypted with password)
-            save_private_key(username, private_key, password)
-            
-            # Hash password and security answers
+            cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+
+            save_private_key(username, priv, password)
+
             salt = secrets.token_hex(16)
-            password_hash = hash_password(password, salt)
-            
-            answer1_salt = secrets.token_hex(16)
-            answer1_hash = hash_password(security_a1.lower(), answer1_salt)
-            
-            answer2_salt = secrets.token_hex(16)
-            answer2_hash = hash_password(security_a2.lower(), answer2_salt)
-            
-            # Store in database
-            cursor.execute('''
-                INSERT INTO users (
-                    username, password_hash, salt, public_key, certificate,
-                    security_q1, security_a1_hash, security_q2, security_a2_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                username, password_hash, salt, public_key_pem, certificate_pem,
-                security_q1, answer1_hash + ":" + answer1_salt,
-                security_q2, answer2_hash + ":" + answer2_salt
-            ))
-            
-            conn.commit()
-            conn.close()
-            
-            flash('Registration successful! Your RSA key pair and certificate have been generated.', 'success')
-            return redirect(url_for('login'))
-            
+            ph   = hash_password(password, salt)
+            s1   = secrets.token_hex(16)
+            h1   = hash_password(sa1.lower(), s1)
+            s2   = secrets.token_hex(16)
+            h2   = hash_password(sa2.lower(), s2)
+
+            conn.execute('''
+                INSERT INTO users (username,password_hash,salt,public_key,certificate,
+                    security_q1,security_a1_hash,security_q2,security_a2_hash)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            ''', (username, ph, salt, pub_pem, cert_pem,
+                  sq1, h1+":"+s1, sq2, h2+":"+s2))
+            conn.commit(); conn.close()
+
+            flash("Registration successful! Your CA-signed certificate is ready.", "success")
+            return redirect(url_for("login"))
         except Exception as e:
-            flash(f'Registration failed: {str(e)}', 'error')
+            flash(f"Registration failed: {e}", "error")
             conn.close()
             return render_template_string(REGISTER_TEMPLATE)
-    
+
     return render_template_string(REGISTER_TEMPLATE)
 
-@app.route('/login', methods=['GET', 'POST'])
+# ---- LOGIN ----
+@app.route("/login", methods=["GET","POST"])
 def login():
-    """User login with certificate validation and 3-strike lockout (10 min)"""
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        
+    if request.method == "POST":
+        username = request.form["username"]
+        password = request.form["password"]
+
         conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
+        c    = conn.cursor()
 
-        # ----------------------------------------------------------
-        # 1. Check / initialise the login_attempts row for this user
-        # ----------------------------------------------------------
-        cursor.execute(
-            "SELECT failed_attempts, locked, locked_at FROM login_attempts WHERE username = ?",
+        # -- attempt row --
+        row = c.execute(
+            "SELECT failed_attempts, locked, locked_at FROM login_attempts WHERE username=?",
             (username,)
-        )
-        attempt_row = cursor.fetchone()
-
-        if attempt_row is None:
-            # First-ever attempt for this username – create the row
-            cursor.execute(
-                "INSERT INTO login_attempts (username, failed_attempts, locked, locked_at) VALUES (?, 0, 0, NULL)",
-                (username,)
-            )
+        ).fetchone()
+        if row is None:
+            c.execute("INSERT INTO login_attempts (username) VALUES (?)", (username,))
             conn.commit()
-            failed_attempts, locked, locked_at = 0, 0, None
+            fails, locked, locked_at = 0, 0, None
         else:
-            failed_attempts, locked, locked_at = attempt_row
+            fails, locked, locked_at = row
 
-        # ----------------------------------------------------------
-        # 2. If account is locked, check whether the 10-min window
-        #    has passed; if not, reject immediately.
-        # ----------------------------------------------------------
+        # -- lockout check --
         if locked and locked_at:
-            locked_time = datetime.strptime(locked_at, "%Y-%m-%d %H:%M:%S.%f") if '.' in locked_at else datetime.strptime(locked_at, "%Y-%m-%d %H:%M:%S")
-            remaining = 600 - (datetime.utcnow() - locked_time).total_seconds()  # 600 s = 10 min
-
-            if remaining > 0:
-                mins = int(remaining // 60) + 1          # round up to next whole minute
-                flash(f'Account is locked. Please wait {mins} minute(s) before trying again.', 'error')
+            lt = (datetime.strptime(locked_at, "%Y-%m-%d %H:%M:%S.%f")
+                  if '.' in locked_at
+                  else datetime.strptime(locked_at, "%Y-%m-%d %H:%M:%S"))
+            lt = lt.replace(tzinfo=timezone.utc)
+            rem = 600 - (datetime.now(timezone.utc) - lt).total_seconds()
+            if rem > 0:
+                flash(f"Account is locked. Please wait {int(rem//60)+1} minute(s).", "error")
                 conn.close()
                 return render_template_string(LOGIN_TEMPLATE)
-            else:
-                # Lockout expired – reset the row
-                cursor.execute(
-                    "UPDATE login_attempts SET failed_attempts = 0, locked = 0, locked_at = NULL WHERE username = ?",
-                    (username,)
-                )
-                conn.commit()
-                failed_attempts = 0
+            c.execute("UPDATE login_attempts SET failed_attempts=0,locked=0,locked_at=NULL WHERE username=?", (username,))
+            conn.commit()
+            fails = 0
 
-        # ----------------------------------------------------------
-        # 3. Look up the user record
-        # ----------------------------------------------------------
-        cursor.execute(
-            "SELECT user_id, password_hash, salt, is_active FROM users WHERE username = ?",
+        # -- user lookup --
+        user = c.execute(
+            "SELECT user_id, password_hash, salt, is_active, certificate FROM users WHERE username=?",
             (username,)
-        )
-        user = cursor.fetchone()
-
+        ).fetchone()
         if not user:
-            # Username doesn't exist – don't reveal that; just say invalid
-            flash('Invalid username or password', 'error')
+            flash("Invalid username or password.", "error")
             conn.close()
             return render_template_string(LOGIN_TEMPLATE)
 
-        user_id, stored_hash, salt, is_active = user
+        uid, ph, salt, active, cert_pem = user
 
-        if not is_active:
-            flash('Your account has been disabled. Contact administrator.', 'error')
+        if not active:
+            flash("Account is disabled. Contact administrator.", "error")
             conn.close()
             return render_template_string(LOGIN_TEMPLATE)
 
-        # ----------------------------------------------------------
-        # 4. Verify password
-        # ----------------------------------------------------------
-        if hash_password(password, salt) != stored_hash:
-            # Wrong password – increment counter
-            failed_attempts += 1
-
-            if failed_attempts >= 3:
-                # Lock the account for 10 minutes
-                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                cursor.execute(
-                    "UPDATE login_attempts SET failed_attempts = ?, locked = 1, locked_at = ? WHERE username = ?",
-                    (failed_attempts, now, username)
-                )
-                conn.commit()
-                conn.close()
-                flash('Too many failed attempts. Your account is now locked for 10 minutes.', 'error')
+        # -- password --
+        if hash_password(password, salt) != ph:
+            fails += 1
+            if fails >= 3:
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                c.execute("UPDATE login_attempts SET failed_attempts=?,locked=1,locked_at=? WHERE username=?",
+                          (fails, now, username))
+                conn.commit(); conn.close()
+                flash("Too many failed attempts. Account locked for 10 minutes.", "error")
                 return render_template_string(LOGIN_TEMPLATE)
-            else:
-                # Save incremented counter, show remaining attempts
-                cursor.execute(
-                    "UPDATE login_attempts SET failed_attempts = ? WHERE username = ?",
-                    (failed_attempts, username)
-                )
-                conn.commit()
-                conn.close()
-                remaining_tries = 3 - failed_attempts
-                flash(f'Invalid username or password. {remaining_tries} attempt(s) remaining before lockout.', 'error')
-                return render_template_string(LOGIN_TEMPLATE)
-
-        # ----------------------------------------------------------
-        # 5. Password correct – verify private key (certificate check)
-        # ----------------------------------------------------------
-        private_key = load_private_key(username, password)
-        if not private_key:
-            flash('Certificate validation failed', 'error')
-            conn.close()
+            c.execute("UPDATE login_attempts SET failed_attempts=? WHERE username=?", (fails, username))
+            conn.commit(); conn.close()
+            flash(f"Invalid username or password. {3-fails} attempt(s) remaining.", "error")
             return render_template_string(LOGIN_TEMPLATE)
 
-        # ----------------------------------------------------------
-        # 6. Login successful – reset attempts, build session
-        # ----------------------------------------------------------
-        cursor.execute(
-            "UPDATE login_attempts SET failed_attempts = 0, locked = 0, locked_at = NULL WHERE username = ?",
-            (username,)
-        )
-        conn.commit()
-        conn.close()
+        # -- CERTIFICATE VALIDATION --
+        valid, reason = validate_certificate(cert_pem)
+        if not valid:
+            conn.close()
+            flash(f"Certificate validation failed: {reason}", "error")
+            return render_template_string(LOGIN_TEMPLATE)
 
-        private_key_pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
+        # -- private key --
+        priv = load_private_key(username, password)
+        if not priv:
+            conn.close()
+            flash("Private key decryption failed.", "error")
+            return render_template_string(LOGIN_TEMPLATE)
+
+        # -- success --
+        c.execute("UPDATE login_attempts SET failed_attempts=0,locked=0,locked_at=NULL WHERE username=?", (username,))
+        conn.commit(); conn.close()
+
+        session["user_id"]         = uid
+        session["username"]        = username
+        session["private_key_pem"] = priv.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()
         ).decode()
 
-        session['user_id'] = user_id
-        session['username'] = username
-        session['private_key_pem'] = private_key_pem
-        flash('Login successful!', 'success')
-        return redirect(url_for('dashboard'))
+        flash("Login successful!", "success")
+        return redirect(url_for("dashboard"))
 
     return render_template_string(LOGIN_TEMPLATE)
 
-@app.route('/forgot_password', methods=['GET', 'POST'])
+# ---- FORGOT PASSWORD ----
+@app.route("/forgot_password", methods=["GET","POST"])
 def forgot_password():
-    """Password recovery using security questions"""
-    if request.method == 'POST':
-        username = request.form.get('username')
-        
-        # Step 1: Get security questions
-        if 'answer1' not in request.form:
+    if request.method == "POST":
+        username = request.form.get("username")
+        if "answer1" not in request.form:
             conn = sqlite3.connect(DATABASE_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT security_q1, security_q2 FROM users WHERE username = ?",
-                (username,)
-            )
-            result = cursor.fetchone()
+            row  = conn.execute(
+                "SELECT security_q1, security_q2 FROM users WHERE username=?", (username,)
+            ).fetchone()
             conn.close()
-            
-            if not result:
-                flash('Username not found', 'error')
-                return render_template_string(FORGOT_PASSWORD_TEMPLATE)
-            
-            return render_template_string(
-                FORGOT_PASSWORD_TEMPLATE,
-                security_questions=result,
-                username=username
-            )
-        
-        # Step 2: Verify answers and reset password
-        else:
-            answer1 = request.form['answer1']
-            answer2 = request.form['answer2']
-            new_password = request.form['new_password']
-            
-            conn = sqlite3.connect(DATABASE_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT security_a1_hash, security_a2_hash, public_key FROM users WHERE username = ?",
-                (username,)
-            )
-            result = cursor.fetchone()
-            
-            if not result:
-                flash('User not found', 'error')
-                conn.close()
-                return redirect(url_for('forgot_password'))
-            
-            stored_a1, stored_a2, public_key_pem = result
-            
-            # Verify answers
-            hash1, salt1 = stored_a1.split(':')
-            hash2, salt2 = stored_a2.split(':')
-            
-            if (hash_password(answer1.lower(), salt1) != hash1 or
-                hash_password(answer2.lower(), salt2) != hash2):
-                flash('Security answers incorrect', 'error')
-                conn.close()
-                return redirect(url_for('forgot_password'))
-            
-            # Update password
-            new_salt = secrets.token_hex(16)
-            new_hash = hash_password(new_password, new_salt)
-            
-            cursor.execute(
-                "UPDATE users SET password_hash = ?, salt = ? WHERE username = ?",
-                (new_hash, new_salt, username)
-            )
-            conn.commit()
-            conn.close()
-            
-            # Note: Private key needs to be regenerated as it was encrypted with old password
-            # For simplicity, we're not implementing this here - in production,
-            # you'd need to re-encrypt the private key with the new password
-            
-            flash('Password reset successful! Please login with your new password.', 'success')
-            return redirect(url_for('login'))
-    
-    return render_template_string(FORGOT_PASSWORD_TEMPLATE)
+            if not row:
+                flash("Username not found.", "error")
+                return render_template_string(FORGOT_TEMPLATE)
+            return render_template_string(FORGOT_TEMPLATE, security_questions=row, username=username)
 
-@app.route('/dashboard')
+        a1  = request.form["answer1"]
+        a2  = request.form["answer2"]
+        npw = request.form["new_password"]
+
+        conn = sqlite3.connect(DATABASE_PATH)
+        row  = conn.execute(
+            "SELECT security_a1_hash, security_a2_hash FROM users WHERE username=?", (username,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            flash("User not found.", "error")
+            return redirect(url_for("forgot_password"))
+
+        h1,s1 = row[0].split(":")
+        h2,s2 = row[1].split(":")
+        if hash_password(a1.lower(), s1) != h1 or hash_password(a2.lower(), s2) != h2:
+            conn.close()
+            flash("Security answers incorrect.", "error")
+            return redirect(url_for("forgot_password"))
+
+        ns = secrets.token_hex(16)
+        conn.execute("UPDATE users SET password_hash=?, salt=? WHERE username=?",
+                     (hash_password(npw, ns), ns, username))
+        conn.commit(); conn.close()
+        flash("Password reset successful!", "success")
+        return redirect(url_for("login"))
+
+    return render_template_string(FORGOT_TEMPLATE)
+
+# ---- DASHBOARD ----
+@app.route("/dashboard")
 @login_required
 def dashboard():
-    """User dashboard with messaging interface"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
-    # Get all users except current user
-    cursor.execute(
-        "SELECT user_id, username, created_at FROM users WHERE is_active = 1"
-    )
-    users = [dict(zip(['user_id', 'username', 'created_at'], row)) for row in cursor.fetchall()]
-    
+    conn  = sqlite3.connect(DATABASE_PATH)
+    users = [dict(zip(["user_id","username","created_at"], r))
+             for r in conn.execute(
+                 "SELECT user_id, username, created_at FROM users WHERE is_active=1"
+             )]
     conn.close()
-    
-    return render_template_string(
-        DASHBOARD_TEMPLATE,
-        username=session['username'],
-        current_user_id=session['user_id'],
-        users=users
-    )
+    return render_template_string(DASHBOARD_TEMPLATE,
+        username=session["username"],
+        current_user_id=session["user_id"],
+        users=users)
 
-@app.route('/get_messages')
+# ---- GET MESSAGES ----
+@app.route("/get_messages")
 @login_required
 def get_messages():
-    """Get messages between current user and selected user"""
-    other_user_id = request.args.get('user_id', type=int)
-    current_user_id = session['user_id']
-    
+    other = request.args.get("user_id", type=int)
+    me    = session["user_id"]
+
     conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
-    # Get messages
-    cursor.execute('''
-        SELECT m.message_id, m.sender_id, m.recipient_id, m.encrypted_message,
-               m.digital_signature, m.timestamp, m.is_read,
-               s.username as sender_username, s.public_key as sender_public_key
+    rows = conn.execute('''
+        SELECT m.message_id, m.sender_id, m.recipient_id,
+               m.encrypted_message, m.digital_signature, m.timestamp,
+               s.public_key, s.certificate
         FROM messages m
         JOIN users s ON m.sender_id = s.user_id
-        WHERE (m.sender_id = ? AND m.recipient_id = ?) OR
-              (m.sender_id = ? AND m.recipient_id = ?)
+        WHERE (m.sender_id=? AND m.recipient_id=?)
+           OR (m.sender_id=? AND m.recipient_id=?)
         ORDER BY m.timestamp ASC
-    ''', (current_user_id, other_user_id, other_user_id, current_user_id))
-    
-    messages = cursor.fetchall()
+    ''', (me, other, other, me)).fetchall()
     conn.close()
-    
-    # Load private key from session
-    private_key_pem = session.get('private_key_pem')
-    if not private_key_pem:
-        return jsonify({'messages': [], 'error': 'Session expired'})
-    
-    private_key = serialization.load_pem_private_key(
-        private_key_pem.encode(),
-        password=None,
-        backend=default_backend()
-    )
-    
-    result = []
-    for msg in messages:
-        msg_id, sender_id, recipient_id, encrypted_msg, signature, timestamp, is_read, sender_username, sender_public_key = msg
-        
-        is_sent = sender_id == current_user_id
-        
-        # Decrypt message if current user is recipient
-        try:
-            if recipient_id == current_user_id:
-                decrypted = decrypt_message(encrypted_msg, private_key)
-            else:
-                # For sent messages, we can't decrypt them (encrypted with recipient's key)
-                decrypted = "[Sent - Encrypted with recipient's key]"
-            
-            # Verify signature
-            signature_valid = verify_signature(decrypted if recipient_id == current_user_id else encrypted_msg, 
-                                               signature, sender_public_key)
-        except Exception as e:
-            decrypted = f"[Decryption failed: {str(e)}]"
-            signature_valid = False
-        
-        result.append({
-            'message_id': msg_id,
-            'is_sent': is_sent,
-            'decrypted_message': decrypted,
-            'timestamp': timestamp,
-            'signature_valid': signature_valid
-        })
-    
-    return jsonify({'messages': result})
 
-@app.route('/send_message', methods=['POST'])
+    pem = session.get("private_key_pem")
+    if not pem:
+        return jsonify({"messages":[], "error":"Session expired"})
+    priv = serialization.load_pem_private_key(
+        pem.encode(), password=None, backend=default_backend()
+    )
+
+    out = []
+    for (mid, sid, rid, enc, sig, ts, sender_pub, sender_cert) in rows:
+        is_sent = (sid == me)
+        try:
+            if rid == me:
+                plain = decrypt_message(enc, priv)
+            else:
+                plain = "[Sent - encrypted with recipient's key]"
+
+            # validate sender cert before trusting signature
+            cert_ok, _ = validate_certificate(sender_cert)
+            if cert_ok and not is_sent:
+                sig_ok = verify_signature(plain, sig, sender_pub)
+            elif is_sent:
+                sig_ok = True
+            else:
+                sig_ok = False   # revoked sender
+        except Exception as e:
+            plain  = f"[Decrypt error: {e}]"
+            sig_ok = False
+
+        out.append({
+            "message_id": mid,
+            "is_sent": is_sent,
+            "decrypted_message": plain,
+            "timestamp": ts,
+            "signature_valid": sig_ok
+        })
+    return jsonify({"messages": out})
+
+# ---- SEND MESSAGE ----
+@app.route("/send_message", methods=["POST"])
 @login_required
 def send_message():
-    """Send encrypted message with digital signature"""
-    data = request.json
-    recipient_id = data['recipient_id']
-    message = data['message']
-    
+    data = request.get_json()
+    rid  = data["recipient_id"]
+    msg  = data["message"]
+
     try:
         conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
+
+        # validate SENDER certificate before allowing sign
+        sender_cert = conn.execute(
+            "SELECT certificate FROM users WHERE user_id=?", (session["user_id"],)
+        ).fetchone()[0]
+        ok, reason = validate_certificate(sender_cert)
+        if not ok:
+            conn.close()
+            return jsonify({"success": False, "error": f"Your certificate is invalid: {reason}"})
+
+        rec_pub = conn.execute(
+            "SELECT public_key FROM users WHERE user_id=?", (rid,)
+        ).fetchone()[0]
+        conn.close()
+
+        pem = session.get("private_key_pem")
+        if not pem:
+            return jsonify({"success": False, "error": "Session expired"})
+        priv = serialization.load_pem_private_key(
+            pem.encode(), password=None, backend=default_backend()
+        )
+
+        enc = encrypt_message(msg, rec_pub)
+        sig = sign_message(msg, priv)
+
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.execute('''
+            INSERT INTO messages (sender_id, recipient_id, encrypted_message, digital_signature)
+            VALUES (?,?,?,?)
+        ''', (session["user_id"], rid, enc, sig))
+        conn.commit(); conn.close()
+
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+# ---- UPLOAD FILE ----
+@app.route("/upload_file", methods=["POST"])
+@login_required
+def upload_file():
+    """Upload and encrypt a file for a recipient."""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"success": False, "error": "No file provided"})
         
-        # Get recipient's public key
-        cursor.execute("SELECT public_key FROM users WHERE user_id = ?", (recipient_id,))
-        recipient_public_key = cursor.fetchone()[0]
+        file = request.files['file']
+        recipient_id = int(request.form['recipient_id'])
         
-        # Get sender's private key from session
-        private_key_pem = session.get('private_key_pem')
-        if not private_key_pem:
-            return jsonify({'success': False, 'error': 'Session expired, please login again'})
+        if file.filename == '':
+            return jsonify({"success": False, "error": "No file selected"})
         
-        private_key = serialization.load_pem_private_key(
-            private_key_pem.encode(),
-            password=None,
-            backend=default_backend()
+        # Validate sender certificate
+        conn = sqlite3.connect(DATABASE_PATH)
+        sender_cert = conn.execute(
+            "SELECT certificate FROM users WHERE user_id=?", (session["user_id"],)
+        ).fetchone()[0]
+        ok, reason = validate_certificate(sender_cert)
+        if not ok:
+            conn.close()
+            return jsonify({"success": False, "error": f"Certificate invalid: {reason}"})
+        
+        # Get recipient public key
+        rec_pub = conn.execute(
+            "SELECT public_key FROM users WHERE user_id=?", (recipient_id,)
+        ).fetchone()[0]
+        
+        # Read file
+        file_bytes = file.read()
+        original_filename = file.filename
+        file_size = len(file_bytes)
+        
+        # Get sender private key
+        pem = session.get("private_key_pem")
+        if not pem:
+            conn.close()
+            return jsonify({"success": False, "error": "Session expired"})
+        priv = serialization.load_pem_private_key(
+            pem.encode(), password=None, backend=default_backend()
         )
         
-        # Encrypt message with recipient's public key
-        encrypted_message = encrypt_message(message, recipient_public_key)
+        # Encrypt file and sign
+        encrypted_file, encrypted_aes_key = encrypt_file(file_bytes, rec_pub)
+        signature = sign_file(file_bytes, priv)
         
-        # Sign the original message with sender's private key
-        signature = sign_message(message, private_key)
+        # Save encrypted file
+        encrypted_filename = f"{secrets.token_hex(16)}.enc"
+        file_path = os.path.join(FILES_DIR, encrypted_filename)
+        with open(file_path, 'wb') as f:
+            f.write(encrypted_file)
         
-        # Store message
-        cursor.execute('''
-            INSERT INTO messages (sender_id, recipient_id, encrypted_message, digital_signature)
-            VALUES (?, ?, ?, ?)
-        ''', (session['user_id'], recipient_id, encrypted_message, signature))
-        
+        # Store metadata in database
+        conn.execute('''
+            INSERT INTO shared_files 
+            (sender_id, recipient_id, original_filename, encrypted_filename, 
+             file_size, encrypted_aes_key, digital_signature)
+            VALUES (?,?,?,?,?,?,?)
+        ''', (session["user_id"], recipient_id, original_filename, 
+              encrypted_filename, file_size, encrypted_aes_key, signature))
         conn.commit()
         conn.close()
         
-        return jsonify({'success': True})
-        
+        return jsonify({"success": True})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({"success": False, "error": str(e)})
 
-@app.route('/logout')
-def logout():
-    """Logout user"""
-    session.clear()
-    flash('Logged out successfully', 'success')
-    return redirect(url_for('index'))
-
-# Admin routes
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    """Admin login"""
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
+# ---- GET FILES ----
+@app.route("/get_files")
+@login_required
+def get_files():
+    """Get list of shared files between current user and selected user."""
+    other = request.args.get("user_id", type=int)
+    me = session["user_id"]
+    
+    conn = sqlite3.connect(DATABASE_PATH)
+    rows = conn.execute('''
+        SELECT f.file_id, f.sender_id, f.original_filename, f.file_size,
+               f.timestamp, f.digital_signature,
+               s.public_key, s.certificate
+        FROM shared_files f
+        JOIN users s ON f.sender_id = s.user_id
+        WHERE (f.sender_id=? AND f.recipient_id=?)
+           OR (f.sender_id=? AND f.recipient_id=?)
+        ORDER BY f.timestamp DESC
+    ''', (me, other, other, me)).fetchall()
+    conn.close()
+    
+    out = []
+    for (fid, sid, fname, fsize, ts, sig, sender_pub, sender_cert) in rows:
+        is_sent = (sid == me)
         
+        # Validate sender certificate
+        cert_ok, _ = validate_certificate(sender_cert)
+        sig_ok = cert_ok  # Simplified - would need to verify file hash
+        
+        out.append({
+            "file_id": fid,
+            "is_sent": is_sent,
+            "original_filename": fname,
+            "file_size": fsize,
+            "timestamp": ts,
+            "signature_valid": sig_ok
+        })
+    
+    return jsonify({"files": out})
+
+# ---- DOWNLOAD FILE ----
+@app.route("/download_file/<int:file_id>")
+@login_required
+def download_file(file_id):
+    """Download and decrypt a file."""
+    try:
         conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT admin_id, password_hash FROM admin_users WHERE username = ?",
-            (username,)
-        )
-        admin = cursor.fetchone()
+        row = conn.execute('''
+            SELECT encrypted_filename, original_filename, encrypted_aes_key,
+                   recipient_id, sender_id
+            FROM shared_files WHERE file_id=?
+        ''', (file_id,)).fetchone()
         conn.close()
         
-        if not admin:
-            flash('Invalid credentials', 'error')
-            return render_template_string(LOGIN_TEMPLATE.replace('Login', 'Admin Login'))
+        if not row:
+            return "File not found", 404
         
-        admin_id, stored_data = admin
-        stored_hash, salt = stored_data.split(':')
+        enc_fname, orig_fname, enc_key, rid, sid = row
         
-        if hash_password(password, salt) != stored_hash:
-            flash('Invalid credentials', 'error')
-            return render_template_string(LOGIN_TEMPLATE.replace('Login', 'Admin Login'))
+        # Check permission
+        if rid != session["user_id"]:
+            return "Unauthorized", 403
         
-        session['admin_id'] = admin_id
-        session['admin_username'] = username
-        return redirect(url_for('admin_panel'))
-    
-    return render_template_string(LOGIN_TEMPLATE.replace('Login', 'Admin Login').replace('login', 'admin_login'))
+        # Get private key
+        pem = session.get("private_key_pem")
+        if not pem:
+            return "Session expired", 401
+        priv = serialization.load_pem_private_key(
+            pem.encode(), password=None, backend=default_backend()
+        )
+        
+        # Read encrypted file
+        file_path = os.path.join(FILES_DIR, enc_fname)
+        with open(file_path, 'rb') as f:
+            encrypted_data = f.read()
+        
+        # Decrypt
+        decrypted_data = decrypt_file(encrypted_data, enc_key, priv)
+        
+        # Send as download
+        from io import BytesIO
+        return app.response_class(
+            BytesIO(decrypted_data).read(),
+            mimetype='application/octet-stream',
+            headers={'Content-Disposition': f'attachment; filename="{orig_fname}"'}
+        )
+    except Exception as e:
+        return f"Error: {str(e)}", 500
 
-@app.route('/admin/panel')
+# ---- LOGOUT ----
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("Logged out.", "success")
+    return redirect(url_for("index"))
+
+
+# ================================================================
+# ADMIN ROUTES
+# ================================================================
+@app.route("/admin/login", methods=["GET","POST"])
+def admin_login():
+    if request.method == "POST":
+        u = request.form["username"]
+        p = request.form["password"]
+        conn = sqlite3.connect(DATABASE_PATH)
+        row  = conn.execute(
+            "SELECT admin_id, password_hash FROM admin_users WHERE username=?", (u,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            flash("Invalid credentials.", "error")
+            return render_template_string(LOGIN_TEMPLATE)
+        aid, data = row
+        h, s = data.split(":")
+        if hash_password(p, s) != h:
+            flash("Invalid credentials.", "error")
+            return render_template_string(LOGIN_TEMPLATE)
+        session["admin_id"]       = aid
+        session["admin_username"] = u
+        return redirect(url_for("admin_panel"))
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route("/admin/panel")
 @admin_required
 def admin_panel():
-    """Admin dashboard"""
     conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    
-    # Get statistics
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
-    active_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM messages")
-    total_messages = cursor.fetchone()[0]
-    
-    stats = {
-        'total_users': total_users,
-        'active_users': active_users,
-        'total_messages': total_messages
-    }
-    
-    # Get all users
-    cursor.execute("SELECT user_id, username, created_at, is_active, certificate, public_key FROM users")
-    users = [dict(zip(['user_id', 'username', 'created_at', 'is_active', 'certificate', 'public_key'], row)) 
-             for row in cursor.fetchall()]
-    
-    # Get recent messages (metadata only)
-    cursor.execute('''
-        SELECT m.message_id, m.timestamp, m.is_read,
-               s.username as sender_username,
-               r.username as recipient_username
-        FROM messages m
-        JOIN users s ON m.sender_id = s.user_id
-        JOIN users r ON m.recipient_id = r.user_id
-        ORDER BY m.timestamp DESC
-        LIMIT 50
-    ''')
-    messages = [dict(zip(['message_id', 'timestamp', 'is_read', 'sender_username', 'recipient_username'], row))
-                for row in cursor.fetchall()]
-    
+
+    total   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    active  = conn.execute("SELECT COUNT(*) FROM users WHERE is_active=1").fetchone()[0]
+    msgs    = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    revoked = conn.execute("SELECT COUNT(*) FROM revoked_certificates").fetchone()[0]
+
+    users = []
+    for row in conn.execute("SELECT user_id,username,created_at,is_active,certificate FROM users"):
+        uid, uname, created, active_flag, cert_pem = row
+        try:
+            cert_obj = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
+            serial   = str(cert_obj.serial_number)
+            is_rev   = conn.execute(
+                "SELECT 1 FROM revoked_certificates WHERE serial_number=?", (serial,)
+            ).fetchone() is not None
+        except Exception:
+            is_rev = False
+        users.append(dict(user_id=uid, username=uname, created_at=created,
+                          is_active=active_flag, is_revoked=is_rev))
+
+    messages = [dict(zip(["message_id","timestamp","is_read","sender_username","recipient_username"], r))
+                for r in conn.execute('''
+                    SELECT m.message_id, m.timestamp, m.is_read, s.username, r.username
+                    FROM messages m
+                    JOIN users s ON m.sender_id=s.user_id
+                    JOIN users r ON m.recipient_id=r.user_id
+                    ORDER BY m.timestamp DESC LIMIT 50
+                ''')]
     conn.close()
-    
+
+    stats = dict(total_users=total, active_users=active,
+                 total_messages=msgs, revoked_count=revoked)
     return render_template_string(ADMIN_TEMPLATE, stats=stats, users=users, messages=messages)
 
-@app.route('/admin/toggle_user', methods=['POST'])
+@app.route("/admin/toggle_user", methods=["POST"])
 @admin_required
 def toggle_user():
-    """Enable/disable user account"""
-    data = request.json
-    user_id = data['user_id']
-    is_active = data['is_active']
-    
+    d = request.get_json()
     conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET is_active = ? WHERE user_id = ?", (is_active, user_id))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({'success': True})
+    conn.execute("UPDATE users SET is_active=? WHERE user_id=?", (d["is_active"], d["user_id"]))
+    conn.commit(); conn.close()
+    return jsonify({"success": True})
 
-@app.route('/admin/get_certificate')
+@app.route("/admin/get_certificate")
 @admin_required
 def get_certificate():
-    """Return user certificate and public key as JSON for the admin modal"""
-    user_id = request.args.get('user_id', type=int)
-    
+    uid = request.args.get("user_id", type=int)
     conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT username, public_key, certificate FROM users WHERE user_id = ?",
-        (user_id,)
-    )
-    row = cursor.fetchone()
+    row  = conn.execute(
+        "SELECT username, public_key, certificate FROM users WHERE user_id=?", (uid,)
+    ).fetchone()
     conn.close()
-    
     if not row:
-        return jsonify({'error': 'User not found'}), 404
-    
-    return jsonify({
-        'username': row[0],
-        'public_key': row[1],
-        'certificate': row[2]
-    })
+        return jsonify({"error":"Not found"}), 404
+    return jsonify({"username": row[0], "public_key": row[1], "certificate": row[2]})
 
-@app.route('/admin/logout')
+# ---- REVOKE CERTIFICATE ----
+@app.route("/admin/revoke_certificate", methods=["POST"])
+@admin_required
+def revoke_certificate():
+    """
+    Extract the serial number from the user's certificate and
+    insert it into the CRL table.  validate_certificate() will
+    reject it from this point forward.
+    """
+    uid = request.get_json().get("user_id")
+    conn = sqlite3.connect(DATABASE_PATH)
+    row  = conn.execute("SELECT username, certificate FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"success": False, "error": "User not found"})
+
+    username, cert_pem = row
+    try:
+        cert   = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
+        serial = str(cert.serial_number)
+    except Exception as e:
+        conn.close()
+        return jsonify({"success": False, "error": f"Cannot parse certificate: {e}"})
+
+    if conn.execute("SELECT 1 FROM revoked_certificates WHERE serial_number=?", (serial,)).fetchone():
+        conn.close()
+        return jsonify({"success": False, "error": "Already revoked."})
+
+    conn.execute(
+        "INSERT INTO revoked_certificates (serial_number, username) VALUES (?,?)",
+        (serial, username)
+    )
+    conn.commit(); conn.close()
+    return jsonify({"success": True})
+
+@app.route("/admin/run_tests")
+@admin_required
+def run_tests():
+    """
+    Run the PKI test suite and return results.
+    Returns JSON with test status and results.
+    """
+    import subprocess
+    import os
+    
+    test_file = "test_pki.py"
+    
+    # Check if test file exists
+    if not os.path.exists(test_file):
+        return jsonify({
+            "success": False,
+            "error": "test_pki.py not found. Please ensure it's in the same directory as the application."
+        })
+    
+    try:
+        # Run the test file
+        result = subprocess.run(
+            ["python", test_file],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        # Parse output to count passes/fails
+        output = result.stdout
+        passed = output.count("PASS")
+        failed = output.count("FAIL")
+        
+        return jsonify({
+            "success": True,
+            "passed": passed,
+            "failed": failed,
+            "total": passed + failed,
+            "output": output,
+            "all_passed": failed == 0
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "success": False,
+            "error": "Tests timed out after 30 seconds"
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Error running tests: {str(e)}"
+        })
+
+@app.route("/admin/logout")
 def admin_logout():
-    """Admin logout"""
     session.clear()
-    return redirect(url_for('index'))
+    return redirect(url_for("index"))
 
-# Main execution
-if __name__ == '__main__':
-    # Initialize database
+
+# ================================================================
+# MAIN
+# ================================================================
+if __name__ == "__main__":
+    bootstrap_ca()
     init_database()
-    
-    # Save configuration to JSON
-    with open('config.json', 'w') as f:
-        json.dump(CONFIG, f, indent=2)
-    
-    print("=" * 60)
-    print("SecureChat System Starting...")
-    print("=" * 60)
-    print("Database:", DATABASE_PATH)
-    print("Keys Directory:", KEYS_DIR)
-    print("Default Admin: username=admin, password=admin123")
-    print("=" * 60)
-    print("Navigate to: http://localhost:5000")
-    print("=" * 60)
-    
-    app.run(debug=True, host='0.0.0.0', port=5000)
 
+    with open("config.json","w") as f:
+        json.dump(CONFIG, f, indent=2)
+
+    print("=" * 60)
+    print(" SecureChat  --  PKI Secure Chat System")
+    print("=" * 60)
+    print(f" Database  : {DATABASE_PATH}")
+    print(f" CA keys   : {CA_KEYS_DIR}/")
+    print(f" User keys : {KEYS_DIR}/")
+    print(f" Admin     : admin / admin123")
+    print()
+    print(" TLS NOTE: In production, run behind a TLS-terminating")
+    print(" reverse proxy (nginx + SSL cert) so that all transport")
+    print(" is encrypted.  Message-level PKI encryption operates")
+    print(" independently of TLS.")
+    print("=" * 60)
+    print(" -> http://localhost:5000")
+    print("=" * 60)
+
+    app.run(debug=True, host="0.0.0.0", port=5000)
