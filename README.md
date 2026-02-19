@@ -1,7 +1,6 @@
 # 🔐 SecureChat - PKI-Based Encrypted Messaging System
 
-**ST6051CEM Practical Cryptography Assignment**  
-**Softwarica College of IT & E-Commerce**
+
 
 A secure chat application implementing Public Key Infrastructure (PKI) for user authentication, end-to-end encrypted messaging, digital signatures, and comprehensive security features.
 
