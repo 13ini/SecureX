@@ -700,11 +700,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html><html><head><title>Dashboard</title>
 .user-item:hover { background:#edf2f7; border-left-color:#667eea; transform:translateX(4px); }
 .user-item.active { background:#ebf8ff; border-left-color:#4299e1; }
 .chat-box { height:300px; overflow-y:auto; border:2px solid #e2e8f0; border-radius:10px; padding:18px; margin-bottom:16px; background:#f7fafc; }
-.msg { margin:12px 0; padding:11px 14px; border-radius:10px; max-width:80%; }
+.msg { margin:12px 0; padding:11px 14px; border-radius:10px; max-width:80%; position:relative; }
 .msg-out { background:linear-gradient(135deg,#667eea,#764ba2); color:#fff; margin-left:auto; text-align:right; }
 .msg-in  { background:#e2e8f0; color:#2d3748; }
+.msg-encrypted { background:#fff3cd; border:2px dashed #ffc107; color:#856404; font-family:'Courier New',monospace; font-size:.85em; }
 .msg-meta { font-size:.78em; opacity:.75; margin-top:4px; }
-.file-item { background:#fef3c7; border-left:4px solid #f59e0b; padding:10px; margin:8px 0; border-radius:8px; }
+.file-item { background:#fef3c7; border-left:4px solid #f59e0b; padding:10px; margin:8px 0; border-radius:8px; position:relative; }
 .file-item-out { margin-left:auto; max-width:80%; }
 .file-item-in { max-width:80%; }
 .compose { display:flex; gap:10px; margin-bottom:12px; }
@@ -714,11 +715,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html><html><head><title>Dashboard</title>
 .file-upload { display:flex; gap:10px; align-items:center; }
 .file-upload input[type="file"] { flex:1; padding:8px; border:2px dashed #e2e8f0; border-radius:8px; font-size:.85em; }
 .btn-upload { padding:8px 20px; background:#48bb78; color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:600; }
-.btn-download { padding:4px 12px; background:#4299e1; color:#fff; border:none; border-radius:5px; cursor:pointer; font-size:.8em; margin-top:6px; }
+.btn-download { padding:4px 12px; background:#4299e1; color:#fff; border:none; border-radius:5px; cursor:pointer; font-size:.8em; margin-top:6px; margin-right:4px; }
+.btn-decrypt { padding:4px 12px; background:#f59e0b; color:#fff; border:none; border-radius:5px; cursor:pointer; font-size:.8em; margin-top:6px; }
+.encrypted-text { font-family:'Courier New',monospace; font-size:.8em; color:#856404; word-break:break-all; }
 .empty { text-align:center; color:#718096; padding:60px 16px; }
 .badge { display:inline-block; padding:2px 7px; border-radius:4px; font-size:.72em; margin-left:4px; color:#fff; }
 .badge-ok { background:#48bb78; }
 .badge-bad { background:#fc8181; }
+.badge-encrypted { background:#ffc107; color:#000; }
 .tab { display:inline-block; padding:8px 16px; cursor:pointer; border-radius:8px 8px 0 0; margin-right:4px; background:#e2e8f0; }
 .tab.active { background:#667eea; color:#fff; }
 </style></head><body>
@@ -759,58 +763,112 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html><html><head><title>Dashboard</title>
 </div>
 <script>
 var sel=null, currentTab='msg';
+var decryptedMessages = {};  // Store decrypted messages by ID
+var decryptedFiles = {};      // Store decrypted file info by ID
+
 function pick(id,name){
   sel=id;
+  decryptedMessages = {};  // Reset when switching users
+  decryptedFiles = {};
   document.querySelectorAll('.user-item').forEach(function(e){e.classList.remove('active');});
   event.currentTarget.classList.add('active');
   document.getElementById('ch').innerHTML='Chat with '+name;
   document.getElementById('compose-area').style.display='block';
   loadContent();
 }
+
 function switchTab(tab){
   currentTab=tab;
   document.getElementById('tabMsg').classList.toggle('active', tab==='msg');
   document.getElementById('tabFile').classList.toggle('active', tab==='file');
   if(sel) loadContent();
 }
+
 function loadContent(){
   if(currentTab==='msg') loadMessages(sel);
   else loadFiles(sel);
 }
+
 function loadMessages(id){
   fetch('/get_messages?user_id='+id).then(function(r){return r.json();}).then(function(d){
     var c=document.getElementById('chat-area');
-    if(!d.messages.length){c.innerHTML='<div class="empty"><div style="font-size:2.6em">&#x1F4ED;</div><p>No messages yet.</p></div>';return;}
+    if(!d.messages.length){
+      c.innerHTML='<div class="empty"><div style="font-size:2.6em">&#x1F4ED;</div><p>No messages yet.</p></div>';
+      return;
+    }
     c.innerHTML=d.messages.map(function(m){
-      var cls=m.is_sent?'msg-out':'msg-in';
-      var badge=m.signature_valid?'<span class="badge badge-ok">Verified</span>':'<span class="badge badge-bad">Invalid</span>';
-      return '<div class="msg '+cls+'"><div>'+m.decrypted_message+'</div><div class="msg-meta">'+m.timestamp+' '+badge+'</div></div>';
+      var isSent = m.is_sent;
+      var isDecrypted = decryptedMessages[m.message_id];
+      
+      if(isSent){
+        // Sent messages - show as sent (encrypted with recipient's key)
+        return '<div class="msg msg-out"><div>'+m.encrypted_message_preview+'</div><div class="msg-meta">'+m.timestamp+' <span class="badge badge-encrypted">&#x1F512; Encrypted</span></div></div>';
+      } else {
+        // Received messages - show encrypted or decrypted
+        if(isDecrypted){
+          var badge = m.signature_valid ? '<span class="badge badge-ok">&#x2713; Verified</span>' : '<span class="badge badge-bad">&#x26A0; Invalid</span>';
+          return '<div class="msg msg-in"><div>'+isDecrypted+'</div><div class="msg-meta">'+m.timestamp+' '+badge+'</div></div>';
+        } else {
+          return '<div class="msg msg-encrypted"><div class="encrypted-text">&#x1F512; '+m.encrypted_message_preview+'</div><div class="msg-meta">'+m.timestamp+' <button class="btn-decrypt" onclick="decryptMessage('+m.message_id+')">Decrypt</button></div></div>';
+        }
+      }
     }).join('');
     c.scrollTop=c.scrollHeight;
   });
 }
+
+function decryptMessage(msgId){
+  fetch('/decrypt_message?message_id='+msgId).then(function(r){return r.json();}).then(function(d){
+    if(d.success){
+      decryptedMessages[msgId] = d.decrypted_message;
+      loadMessages(sel);
+    } else {
+      alert('Decryption failed: '+d.error);
+    }
+  });
+}
+
 function loadFiles(id){
   fetch('/get_files?user_id='+id).then(function(r){return r.json();}).then(function(d){
     var c=document.getElementById('chat-area');
-    if(!d.files.length){c.innerHTML='<div class="empty"><div style="font-size:2.6em">&#x1F4C1;</div><p>No files shared yet.</p></div>';return;}
+    if(!d.files.length){
+      c.innerHTML='<div class="empty"><div style="font-size:2.6em">&#x1F4C1;</div><p>No files shared yet.</p></div>';
+      return;
+    }
     c.innerHTML=d.files.map(function(f){
       var cls=f.is_sent?'file-item file-item-out':'file-item file-item-in';
-      var badge=f.signature_valid?'<span class="badge badge-ok">Verified</span>':'<span class="badge badge-bad">Invalid</span>';
-      var dl=f.is_sent?'':'<button class="btn-download" onclick="downloadFile('+f.file_id+',\\''+f.original_filename+'\\')">Download</button>';
+      var badge=f.signature_valid?'<span class="badge badge-ok">&#x2713; Verified</span>':'<span class="badge badge-bad">&#x26A0; Invalid</span>';
+      var dl='';
+      if(!f.is_sent){
+        dl='<button class="btn-decrypt" onclick="decryptFile('+f.file_id+')">Decrypt & Download</button>';
+      } else {
+        dl='<span class="badge badge-encrypted">&#x1F512; Encrypted</span>';
+      }
       return '<div class="'+cls+'"><strong>&#x1F4CE; '+f.original_filename+'</strong> ('+f.file_size+' bytes)<div class="msg-meta">'+f.timestamp+' '+badge+'</div>'+dl+'</div>';
     }).join('');
   });
 }
+
+function decryptFile(fileId){
+  // Trigger download which will decrypt on the server side
+  window.location.href='/download_file/'+fileId;
+}
+
 function send(){
   var v=document.getElementById('mi').value.trim();
   if(!v||!sel){alert('Enter a message');return;}
   if(v.length>190){alert('Max 190 chars for RSA.');return;}
   fetch('/send_message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient_id:sel,message:v})})
   .then(function(r){return r.json();}).then(function(d){
-    if(d.success){document.getElementById('mi').value='';loadMessages(sel);}
+    if(d.success){
+      document.getElementById('mi').value='';
+      decryptedMessages = {};  // Clear decrypted cache
+      loadMessages(sel);
+    }
     else alert('Error: '+d.error);
   });
 }
+
 function uploadFile(){
   var file=document.getElementById('fileInput').files[0];
   if(!file||!sel){alert('Select a file first');return;}
@@ -819,13 +877,16 @@ function uploadFile(){
   formData.append('recipient_id',sel);
   fetch('/upload_file',{method:'POST',body:formData})
   .then(function(r){return r.json();}).then(function(d){
-    if(d.success){document.getElementById('fileInput').value='';loadFiles(sel);alert('File uploaded & encrypted!');}
+    if(d.success){
+      document.getElementById('fileInput').value='';
+      decryptedFiles = {};  // Clear decrypted cache
+      loadFiles(sel);
+      alert('File uploaded & encrypted!');
+    }
     else alert('Error: '+d.error);
   });
 }
-function downloadFile(fileId, filename){
-  window.location.href='/download_file/'+fileId;
-}
+
 setInterval(function(){if(sel)loadContent();},5000);
 </script>
 </body></html>"""
@@ -1201,6 +1262,7 @@ def dashboard():
 @app.route("/get_messages")
 @login_required
 def get_messages():
+    """Get list of messages (encrypted) between current user and selected user."""
     other = request.args.get("user_id", type=int)
     me    = session["user_id"]
 
@@ -1217,42 +1279,79 @@ def get_messages():
     ''', (me, other, other, me)).fetchall()
     conn.close()
 
-    pem = session.get("private_key_pem")
-    if not pem:
-        return jsonify({"messages":[], "error":"Session expired"})
-    priv = serialization.load_pem_private_key(
-        pem.encode(), password=None, backend=default_backend()
-    )
-
     out = []
     for (mid, sid, rid, enc, sig, ts, sender_pub, sender_cert) in rows:
         is_sent = (sid == me)
-        try:
-            if rid == me:
-                plain = decrypt_message(enc, priv)
-            else:
-                plain = "[Sent - encrypted with recipient's key]"
-
-            # validate sender cert before trusting signature
-            cert_ok, _ = validate_certificate(sender_cert)
-            if cert_ok and not is_sent:
-                sig_ok = verify_signature(plain, sig, sender_pub)
-            elif is_sent:
-                sig_ok = True
-            else:
-                sig_ok = False   # revoked sender
-        except Exception as e:
-            plain  = f"[Decrypt error: {e}]"
-            sig_ok = False
-
+        
+        # Show encrypted preview (first 40 chars of ciphertext)
+        encrypted_preview = enc[:40] + "..." if len(enc) > 40 else enc
+        
+        # Validate sender cert (for signature verification later)
+        cert_ok, _ = validate_certificate(sender_cert)
+        
         out.append({
             "message_id": mid,
             "is_sent": is_sent,
-            "decrypted_message": plain,
+            "encrypted_message_preview": encrypted_preview,
             "timestamp": ts,
+            "signature_valid": cert_ok  # Will be verified after decryption
+        })
+    
+    return jsonify({"messages": out})
+
+# ---- DECRYPT SINGLE MESSAGE ----
+@app.route("/decrypt_message")
+@login_required
+def decrypt_message_route():
+    """Decrypt a single message on-demand."""
+    message_id = request.args.get("message_id", type=int)
+    me = session["user_id"]
+    
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        row = conn.execute('''
+            SELECT m.encrypted_message, m.digital_signature, m.sender_id, m.recipient_id,
+                   s.public_key, s.certificate
+            FROM messages m
+            JOIN users s ON m.sender_id = s.user_id
+            WHERE m.message_id = ?
+        ''', (message_id,)).fetchone()
+        conn.close()
+        
+        if not row:
+            return jsonify({"success": False, "error": "Message not found"})
+        
+        enc, sig, sid, rid, sender_pub, sender_cert = row
+        
+        # Check if current user is the recipient
+        if rid != me:
+            return jsonify({"success": False, "error": "Not authorized"})
+        
+        # Get private key from session
+        pem = session.get("private_key_pem")
+        if not pem:
+            return jsonify({"success": False, "error": "Session expired"})
+        
+        priv = serialization.load_pem_private_key(
+            pem.encode(), password=None, backend=default_backend()
+        )
+        
+        # Decrypt message
+        plain = decrypt_message(enc, priv)
+        
+        # Validate sender certificate and verify signature
+        cert_ok, _ = validate_certificate(sender_cert)
+        sig_ok = False
+        if cert_ok:
+            sig_ok = verify_signature(plain, sig, sender_pub)
+        
+        return jsonify({
+            "success": True,
+            "decrypted_message": plain,
             "signature_valid": sig_ok
         })
-    return jsonify({"messages": out})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
 
 # ---- SEND MESSAGE ----
 @app.route("/send_message", methods=["POST"])
@@ -1672,5 +1771,6 @@ if __name__ == "__main__":
     print("=" * 60)
 
     app.run(debug=True, host="0.0.0.0", port=5000)
+
 
 
