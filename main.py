@@ -1345,6 +1345,12 @@ def decrypt_message_route():
         if cert_ok:
             sig_ok = verify_signature(plain, sig, sender_pub)
         
+        # Mark message as read
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.execute("UPDATE messages SET is_read = 1 WHERE message_id = ?", (message_id,))
+        conn.commit()
+        conn.close()
+        
         return jsonify({
             "success": True,
             "decrypted_message": plain,
@@ -1546,6 +1552,12 @@ def download_file(file_id):
         
         # Decrypt
         decrypted_data = decrypt_file(encrypted_data, enc_key, priv)
+        
+        # Mark as downloaded
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.execute("UPDATE shared_files SET is_downloaded = 1 WHERE file_id = ?", (file_id,))
+        conn.commit()
+        conn.close()
         
         # Send as download
         from io import BytesIO
@@ -1771,4 +1783,3 @@ if __name__ == "__main__":
     print("=" * 60)
 
     app.run(debug=True, host="0.0.0.0", port=5000)
-
